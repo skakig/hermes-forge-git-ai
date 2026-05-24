@@ -15,6 +15,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   bad_state: "The sign-in request expired or was tampered with. Start the flow again — it must complete within 10 minutes.",
   token_exchange: "GitHub rejected the token exchange. The OAuth App's client secret may be wrong, or the callback URL doesn't match exactly.",
   store: "We got your GitHub token but couldn't save it. Check the server logs for the database error.",
+  missing_app_slug: "Your GitHub credentials are for a GitHub App, but the app's public slug isn't configured yet. Add the GITHUB_APP_SLUG secret (the URL slug from https://github.com/apps/<slug>) and try again.",
 };
 
 export const Route = createFileRoute("/dashboard/repos")({
@@ -55,7 +56,13 @@ function ReposPage() {
       window.location.assign(url);
     } catch (e) {
       console.error(e);
-      toast.error("Could not start GitHub connection");
+      const msg = e instanceof Error ? e.message : String(e);
+      const code = msg.includes("missing_app_slug") ? "missing_app_slug" : undefined;
+      if (code) {
+        navigate({ to: "/dashboard/repos", search: { error: code }, replace: true });
+      } else {
+        toast.error("Could not start GitHub connection");
+      }
       setLoading(false);
     }
   };

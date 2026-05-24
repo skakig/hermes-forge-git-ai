@@ -21,6 +21,7 @@ import { Route as DashboardReposRouteImport } from './routes/dashboard.repos'
 import { Route as DashboardGoalsRouteImport } from './routes/dashboard.goals'
 import { Route as DashboardActivityRouteImport } from './routes/dashboard.activity'
 import { Route as AuthGithubCallbackRouteImport } from './routes/auth.github.callback'
+import { Route as ApiGithubInstallCallbackRouteImport } from './routes/api.github.install.callback'
 
 const PricingRoute = PricingRouteImport.update({
   id: '/pricing',
@@ -82,6 +83,12 @@ const AuthGithubCallbackRoute = AuthGithubCallbackRouteImport.update({
   path: '/auth/github/callback',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiGithubInstallCallbackRoute =
+  ApiGithubInstallCallbackRouteImport.update({
+    id: '/api/github/install/callback',
+    path: '/api/github/install/callback',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -96,6 +103,7 @@ export interface FileRoutesByFullPath {
   '/dashboard/settings': typeof DashboardSettingsRoute
   '/dashboard/': typeof DashboardIndexRoute
   '/auth/github/callback': typeof AuthGithubCallbackRoute
+  '/api/github/install/callback': typeof ApiGithubInstallCallbackRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -109,6 +117,7 @@ export interface FileRoutesByTo {
   '/dashboard/settings': typeof DashboardSettingsRoute
   '/dashboard': typeof DashboardIndexRoute
   '/auth/github/callback': typeof AuthGithubCallbackRoute
+  '/api/github/install/callback': typeof ApiGithubInstallCallbackRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -124,6 +133,7 @@ export interface FileRoutesById {
   '/dashboard/settings': typeof DashboardSettingsRoute
   '/dashboard/': typeof DashboardIndexRoute
   '/auth/github/callback': typeof AuthGithubCallbackRoute
+  '/api/github/install/callback': typeof ApiGithubInstallCallbackRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -140,6 +150,7 @@ export interface FileRouteTypes {
     | '/dashboard/settings'
     | '/dashboard/'
     | '/auth/github/callback'
+    | '/api/github/install/callback'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -153,6 +164,7 @@ export interface FileRouteTypes {
     | '/dashboard/settings'
     | '/dashboard'
     | '/auth/github/callback'
+    | '/api/github/install/callback'
   id:
     | '__root__'
     | '/'
@@ -167,6 +179,7 @@ export interface FileRouteTypes {
     | '/dashboard/settings'
     | '/dashboard/'
     | '/auth/github/callback'
+    | '/api/github/install/callback'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -177,6 +190,7 @@ export interface RootRouteChildren {
   LoginRoute: typeof LoginRoute
   PricingRoute: typeof PricingRoute
   AuthGithubCallbackRoute: typeof AuthGithubCallbackRoute
+  ApiGithubInstallCallbackRoute: typeof ApiGithubInstallCallbackRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -265,6 +279,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthGithubCallbackRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/github/install/callback': {
+      id: '/api/github/install/callback'
+      path: '/api/github/install/callback'
+      fullPath: '/api/github/install/callback'
+      preLoaderRoute: typeof ApiGithubInstallCallbackRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -296,17 +317,8 @@ const rootRouteChildren: RootRouteChildren = {
   LoginRoute: LoginRoute,
   PricingRoute: PricingRoute,
   AuthGithubCallbackRoute: AuthGithubCallbackRoute,
+  ApiGithubInstallCallbackRoute: ApiGithubInstallCallbackRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
   ._addFileTypes<FileRouteTypes>()
-
-import type { getRouter } from './router.tsx'
-import type { startInstance } from './start.ts'
-declare module '@tanstack/react-start' {
-  interface Register {
-    ssr: true
-    router: Awaited<ReturnType<typeof getRouter>>
-    config: Awaited<ReturnType<typeof startInstance.getOptions>>
-  }
-}

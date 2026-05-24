@@ -62,6 +62,36 @@ export type Database = {
           },
         ]
       }
+      github_installations: {
+        Row: {
+          account_login: string
+          account_type: string
+          created_at: string
+          id: string
+          installation_id: number
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          account_login: string
+          account_type?: string
+          created_at?: string
+          id?: string
+          installation_id: number
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          account_login?: string
+          account_type?: string
+          created_at?: string
+          id?: string
+          installation_id?: number
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
       goals: {
         Row: {
           active: boolean

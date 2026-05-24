@@ -8,7 +8,7 @@ export const Route = createFileRoute("/dashboard")({
   beforeLoad: async ({ location }) => {
     const { data } = await supabase.auth.getSession();
     if (!data.session) {
-      throw redirect({ to: "/", search: { redirect: location.href } as never });
+      throw redirect({ to: "/login", search: { redirect: location.href } as never });
     }
   },
   component: DashboardLayout,

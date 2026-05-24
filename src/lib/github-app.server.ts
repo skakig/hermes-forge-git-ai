@@ -16,14 +16,25 @@ function base64urlEncode(input: ArrayBuffer | Uint8Array | string): string {
 }
 
 function pemToArrayBuffer(pem: string): ArrayBuffer {
-  const clean = pem
-    .replace(/-----BEGIN [A-Z0-9 ]+-----/g, "")
-    .replace(/-----END [A-Z0-9 ]+-----/g, "")
-    .replace(/\s+/g, "");
-  // Only base64 chars allowed; reject anything else with a clear message.
-  if (!/^[A-Za-z0-9+/=]+$/.test(clean)) {
+  // Strip PEM armor + any whitespace, convert base64url → base64,
+  // drop any stray non-base64 characters, then pad to a multiple of 4.
+  let clean = pem
+    .replace(/-----BEGIN [^-]+-----/g, "")
+    .replace(/-----END [^-]+-----/g, "")
+    .replace(/\s+/g, "")
+    // base64url → base64
+    .replace(/-/g, "+")
+    .replace(/_/g, "/")
+    // strip any remaining non-base64 characters (e.g. stray quotes)
+    .replace(/[^A-Za-z0-9+/=]/g, "")
+    // remove any '=' that aren't at the end, then re-pad below
+    .replace(/=+/g, "");
+  const pad = clean.length % 4;
+  if (pad === 2) clean += "==";
+  else if (pad === 3) clean += "=";
+  else if (pad === 1) {
     throw new Error(
-      "invalid_private_key: GITHUB_APP_PRIVATE_KEY contains non-base64 characters after stripping PEM armor. Re-paste the .pem file contents (including the BEGIN/END lines).",
+      "invalid_private_key: GITHUB_APP_PRIVATE_KEY base64 body has an impossible length (mod 4 === 1). The secret is truncated — re-paste the full .pem contents.",
     );
   }
   let binary: string;
@@ -31,7 +42,7 @@ function pemToArrayBuffer(pem: string): ArrayBuffer {
     binary = atob(clean);
   } catch (e) {
     throw new Error(
-      `invalid_private_key: base64 decode failed (${e instanceof Error ? e.message : String(e)}). The secret is likely truncated or wrapped with extra characters.`,
+      `invalid_private_key: base64 decode failed (${e instanceof Error ? e.message : String(e)}). The secret is likely truncated. Re-paste the full .pem contents.`,
     );
   }
   const buf = new Uint8Array(binary.length);

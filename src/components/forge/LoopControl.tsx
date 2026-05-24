@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Flame, Loader2, Square, ExternalLink } from "lucide-react";
+import { Flame, Loader2, ExternalLink } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { useServerFn } from "@tanstack/react-start";

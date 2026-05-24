@@ -36,12 +36,12 @@ export function MarketingShell({ children }: { children: ReactNode }) {
             ))}
           </nav>
           <div className="flex items-center gap-2">
-            <Link to="/dashboard" className="hidden sm:block">
+            <Link to="/login" className="hidden sm:block">
               <Button variant="ghost" size="sm" className="gap-2">
                 <Github className="size-4" /> Sign in
               </Button>
             </Link>
-            <Link to="/dashboard/repos">
+            <Link to="/login" search={{ redirect: "/dashboard/repos" }}>
               <Button size="sm" className="ember-gradient text-primary-foreground border-0 gap-2 shadow-[var(--shadow-ember)]">
                 <Flame className="size-4" /> Ignite the Forge
               </Button>

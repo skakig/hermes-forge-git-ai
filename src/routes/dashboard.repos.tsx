@@ -1,11 +1,28 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { useServerFn } from "@tanstack/react-start";
+import { useState } from "react";
+import { toast } from "sonner";
 import { RepoCard } from "@/components/forge/RepoCard";
 import { Button } from "@/components/ui/button";
 import { Github, Plus } from "lucide-react";
+import { startGithubOAuth } from "@/lib/github-oauth.functions";
 
 export const Route = createFileRoute("/dashboard/repos")({ component: ReposPage });
 
 function ReposPage() {
+  const startOAuth = useServerFn(startGithubOAuth);
+  const [loading, setLoading] = useState(false);
+  const connect = async () => {
+    try {
+      setLoading(true);
+      const { url } = await startOAuth();
+      window.location.assign(url);
+    } catch (e) {
+      console.error(e);
+      toast.error("Could not start GitHub connection");
+      setLoading(false);
+    }
+  };
   return (
     <div className="max-w-7xl mx-auto space-y-6">
       <div className="flex items-center justify-between">
@@ -13,7 +30,7 @@ function ReposPage() {
           <h1 className="font-display text-3xl">Repositories</h1>
           <p className="text-sm text-muted-foreground mt-1">Connect any GitHub repo for the agent to forge.</p>
         </div>
-        <Button className="ember-gradient text-primary-foreground border-0 gap-2"><Plus className="size-4" /> Connect repo</Button>
+        <Button onClick={connect} disabled={loading} className="ember-gradient text-primary-foreground border-0 gap-2"><Plus className="size-4" /> {loading ? "Redirecting…" : "Connect repo"}</Button>
       </div>
       <div className="rounded-xl border border-primary/30 glass p-6 flex items-center gap-4">
         <div className="size-12 rounded-lg ember-gradient grid place-items-center text-primary-foreground"><Github className="size-5" /></div>
@@ -21,7 +38,7 @@ function ReposPage() {
           <div className="font-display text-lg">Install the Hermes GitHub App</div>
           <div className="text-sm text-muted-foreground">Grant the agent the access it needs to open branches and pull requests autonomously.</div>
         </div>
-        <Button variant="outline">Install</Button>
+        <Button variant="outline" onClick={connect} disabled={loading}>{loading ? "Redirecting…" : "Connect"}</Button>
       </div>
       <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
         {Array.from({ length: 9 }).map((_, i) => (

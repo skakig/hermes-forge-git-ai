@@ -409,7 +409,7 @@ function ReposPage() {
           <div className="flex-1">
             <div className="font-display text-lg">Install the Hermes Forge GitHub App</div>
             <div className="text-sm text-muted-foreground">
-              On the next screen, pick which repositories Hermes can read, refactor, and open PRs against. You can change this anytime in GitHub settings.
+              On the next screen, pick which repositories Hermes can read, refactor, and open PRs against. Already installed? Click <span className="text-foreground">Re-sync from GitHub</span> above to link it.
             </div>
           </div>
           <Button variant="outline" onClick={connect} disabled={loading}>
@@ -418,6 +418,10 @@ function ReposPage() {
         </div>
       ) : null}
 
+      {/* Always show health probe so users get diagnostics whether or not
+          an installation is linked. */}
+      <InstallationHealthCard />
+
       {isConnected && reposQuery.isLoading ? (
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {Array.from({ length: 6 }).map((_, i) => (
@@ -425,8 +429,6 @@ function ReposPage() {
           ))}
         </div>
       ) : null}
-
-      {isConnected ? <InstallationHealthCard /> : null}
 
       {isConnected && repos.length > 0 ? (
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -465,7 +467,14 @@ function ReposPage() {
         </div>
       ) : null}
 
-      {isConnected && !reposQuery.isLoading && repos.length === 0 ? (
+      {isConnected && reposQuery.data?.error ? (
+        <div className="rounded-xl border border-destructive/40 bg-destructive/5 p-4 text-sm">
+          <div className="font-medium text-destructive">Couldn't load repositories</div>
+          <div className="text-muted-foreground mt-1 break-words">{reposQuery.data.error}</div>
+        </div>
+      ) : null}
+
+      {isConnected && !reposQuery.isLoading && repos.length === 0 && !reposQuery.data?.error ? (
         <div className="rounded-xl border border-border/60 glass p-8 text-center text-sm text-muted-foreground">
           The GitHub App has no repositories yet. Open the app settings on GitHub and grant it access to at least one repo.
         </div>

@@ -119,49 +119,61 @@ export type Database = {
       loops: {
         Row: {
           branch: string | null
+          bug_report: string | null
           created_at: string
           finished_at: string | null
           goals: string[]
           hermes_run_id: string | null
           id: string
           phase: string
+          plan: Json | null
+          pr_is_draft: boolean
           pr_number: number | null
           pr_url: string | null
           repository_id: string
           started_at: string
           status: string
+          suspect_files: string[]
           updated_at: string
           user_id: string
         }
         Insert: {
           branch?: string | null
+          bug_report?: string | null
           created_at?: string
           finished_at?: string | null
           goals?: string[]
           hermes_run_id?: string | null
           id?: string
           phase?: string
+          plan?: Json | null
+          pr_is_draft?: boolean
           pr_number?: number | null
           pr_url?: string | null
           repository_id: string
           started_at?: string
           status?: string
+          suspect_files?: string[]
           updated_at?: string
           user_id: string
         }
         Update: {
           branch?: string | null
+          bug_report?: string | null
           created_at?: string
           finished_at?: string | null
           goals?: string[]
           hermes_run_id?: string | null
           id?: string
           phase?: string
+          plan?: Json | null
+          pr_is_draft?: boolean
           pr_number?: number | null
           pr_url?: string | null
           repository_id?: string
           started_at?: string
           status?: string
+          suspect_files?: string[]
           updated_at?: string
           user_id?: string
         }

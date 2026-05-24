@@ -41,12 +41,12 @@ function Landing() {
             generates improvements, and ships them as clean pull requests — autonomously.
           </p>
           <div className="mt-10 flex flex-col sm:flex-row gap-3 justify-center">
-            <Link to="/dashboard/repos">
+            <Link to="/login" search={{ redirect: "/dashboard/repos" }}>
               <Button size="lg" className="ember-gradient text-primary-foreground border-0 shadow-[var(--shadow-ember)] gap-2">
                 <Flame className="size-4" /> Ignite the Forge <ArrowRight className="size-4" />
               </Button>
             </Link>
-            <Link to="/dashboard/repos">
+            <Link to="/login" search={{ redirect: "/dashboard/repos" }}>
               <Button size="lg" variant="outline" className="gap-2">
                 <Github className="size-4" /> Connect a repository
               </Button>
@@ -117,7 +117,7 @@ function Landing() {
             <Zap className="size-8 text-primary mx-auto mb-4" />
             <h2 className="font-display text-3xl md:text-5xl text-glow">Stop reviewing. Start forging.</h2>
             <p className="mt-4 text-muted-foreground">Connect a repository. The agent does the rest.</p>
-            <Link to="/dashboard/repos" className="inline-block mt-8">
+            <Link to="/login" search={{ redirect: "/dashboard/repos" }} className="inline-block mt-8">
               <Button size="lg" className="ember-gradient text-primary-foreground border-0 shadow-[var(--shadow-ember)] gap-2">
                 <Flame className="size-4" /> Ignite the Forge <ArrowRight className="size-4" />
               </Button>

@@ -150,7 +150,6 @@ export type Database = {
           avatar_url: string | null
           created_at: string
           display_name: string | null
-          github_access_token: string | null
           github_username: string | null
           id: string
           updated_at: string
@@ -160,7 +159,6 @@ export type Database = {
           avatar_url?: string | null
           created_at?: string
           display_name?: string | null
-          github_access_token?: string | null
           github_username?: string | null
           id?: string
           updated_at?: string
@@ -170,7 +168,6 @@ export type Database = {
           avatar_url?: string | null
           created_at?: string
           display_name?: string | null
-          github_access_token?: string | null
           github_username?: string | null
           id?: string
           updated_at?: string
@@ -218,6 +215,33 @@ export type Database = {
           owner?: string
           private?: boolean
           status?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
+      user_github_credentials: {
+        Row: {
+          access_token: string
+          created_at: string
+          github_username: string | null
+          scope: string | null
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          access_token: string
+          created_at?: string
+          github_username?: string | null
+          scope?: string | null
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          access_token?: string
+          created_at?: string
+          github_username?: string | null
+          scope?: string | null
           updated_at?: string
           user_id?: string
         }

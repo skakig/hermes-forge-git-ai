@@ -1,25 +1,30 @@
 import { useEffect, useState } from "react";
-import { Flame, Loader2, ExternalLink } from "lucide-react";
+import { Flame, Loader2, ExternalLink, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger,
+} from "@/components/ui/dialog";
 import { toast } from "sonner";
 import { useServerFn } from "@tanstack/react-start";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { startHermesLoop, pollLoopStatus, listLoops } from "@/lib/hermes.functions";
+import { startHermesLoop, pollLoopStatus, listLoops, cancelLoop } from "@/lib/hermes.functions";
 import { listConnectedRepos } from "@/lib/dashboard.functions";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 
-const phaseOrder = ["queued", "starting", "auditing", "critiquing", "generating", "drafting", "completed"];
+const phaseOrder = ["audit", "plan", "draft_pr", "patch", "commit", "ready", "completed"];
 const phaseLabels: Record<string, string> = {
-  queued: "Queued",
-  starting: "Starting loop",
-  auditing: "Auditing source tree",
-  critiquing: "Critiquing quality & content",
-  generating: "Generating improvements",
-  drafting: "Drafting branch & PR",
-  completed: "PR opened",
+  audit: "Auditing source tree",
+  plan: "Forming a plan",
+  draft_pr: "Opening draft PR",
+  patch: "Editing files",
+  commit: "Pushing commits",
+  ready: "Flipping to ready for review",
+  completed: "Done",
   error: "Failed",
+  canceled: "Canceled",
 };
 
 export function LoopControl() {
@@ -28,7 +33,10 @@ export function LoopControl() {
   const fetchLoops = useServerFn(listLoops);
   const startFn = useServerFn(startHermesLoop);
   const pollFn = useServerFn(pollLoopStatus);
+  const cancelFn = useServerFn(cancelLoop);
   const [selectedRepo, setSelectedRepo] = useState<string | undefined>();
+  const [bugReport, setBugReport] = useState("");
+  const [dialogOpen, setDialogOpen] = useState(false);
 
   const reposQuery = useQuery({
     queryKey: ["forge", "connected-repos"],
@@ -46,31 +54,42 @@ export function LoopControl() {
     (l) => l.status === "running" || l.status === "queued",
   );
 
-  // Poll the active loop more aggressively
+  // Poll the active loop more aggressively (drives phase transitions server-side)
   useEffect(() => {
     if (!activeLoop) return;
     const id = setInterval(() => {
       pollFn({ data: { loop_id: activeLoop.id } })
         .then(() => queryClient.invalidateQueries({ queryKey: ["forge"] }))
         .catch(() => {});
-    }, 4000);
+    }, 5000);
     return () => clearInterval(id);
   }, [activeLoop?.id, pollFn, queryClient]);
 
   const startMutation = useMutation({
-    mutationFn: (repository_id: string) => startFn({ data: { repository_id } }),
+    mutationFn: (args: { repository_id: string; bug_report?: string }) => startFn({ data: args }),
     onSuccess: () => {
-      toast("Self-Improvement Loop ignited", { description: "Hermes is starting on your repo." });
+      toast("Self-Improvement Loop ignited", { description: "Hermes is auditing your repo." });
+      setDialogOpen(false);
+      setBugReport("");
       queryClient.invalidateQueries({ queryKey: ["forge"] });
     },
     onError: (e) => toast.error(e instanceof Error ? e.message : "Failed to start loop"),
+  });
+
+  const cancelMutation = useMutation({
+    mutationFn: (loop_id: string) => cancelFn({ data: { loop_id } }),
+    onSuccess: () => {
+      toast("Loop canceled");
+      queryClient.invalidateQueries({ queryKey: ["forge"] });
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "Cancel failed"),
   });
 
   const repos = reposQuery.data?.repos ?? [];
   const running = !!activeLoop;
   const currentPhase = activeLoop?.phase ?? "queued";
   const currentIdx = Math.max(0, phaseOrder.indexOf(currentPhase));
-  const visiblePhases = phaseOrder.slice(0, 6);
+  const visiblePhases = phaseOrder;
 
   return (
     <div className="relative overflow-hidden rounded-2xl border border-primary/30 p-6 glass">
@@ -83,33 +102,89 @@ export function LoopControl() {
           <p className="text-sm text-muted-foreground mt-2 max-w-lg">
             {repos.length === 0
               ? "Add a repository to The Forge first (Dashboard → Repositories) before igniting a loop."
-              : "The agent will audit the repo, critique quality, generate refinements, then open a clean branch and pull request — autonomously."}
+              : "The agent audits the repo, drafts a PR with its plan, edits files, then flips the PR to ready for review — autonomously."}
           </p>
         </div>
         <div className="flex items-center gap-3">
-          {!running && repos.length > 0 ? (
-            <Select value={selectedRepo} onValueChange={setSelectedRepo}>
-              <SelectTrigger className="w-[220px]"><SelectValue placeholder="Choose repo" /></SelectTrigger>
-              <SelectContent>
-                {repos.map((r) => (
-                  <SelectItem key={r.id} value={r.id}>{r.full_name}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          ) : null}
           {running ? (
-            <Button size="lg" variant="outline" disabled className="gap-2">
-              <Loader2 className="size-4 animate-spin" /> Running…
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button size="lg" variant="outline" disabled className="gap-2">
+                <Loader2 className="size-4 animate-spin" /> Running…
+              </Button>
+              <Button
+                size="icon"
+                variant="ghost"
+                aria-label="Cancel loop"
+                onClick={() => cancelMutation.mutate(activeLoop!.id)}
+                disabled={cancelMutation.isPending}
+              >
+                <X className="size-4" />
+              </Button>
+            </div>
           ) : (
-            <Button
-              size="lg"
-              onClick={() => selectedRepo && startMutation.mutate(selectedRepo)}
-              disabled={!selectedRepo || startMutation.isPending || repos.length === 0}
-              className="gap-2 ember-gradient text-primary-foreground border-0 shadow-[var(--shadow-ember)] hover:opacity-95"
-            >
-              <Flame className="size-4" /> {startMutation.isPending ? "Igniting…" : "Ignite loop"}
-            </Button>
+            <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+              <DialogTrigger asChild>
+                <Button
+                  size="lg"
+                  disabled={repos.length === 0}
+                  className="gap-2 ember-gradient text-primary-foreground border-0 shadow-[var(--shadow-ember)] hover:opacity-95"
+                >
+                  <Flame className="size-4" /> Ignite loop
+                </Button>
+              </DialogTrigger>
+              <DialogContent className="sm:max-w-lg">
+                <DialogHeader>
+                  <DialogTitle className="font-display text-2xl">Ignite a Self-Improvement Loop</DialogTitle>
+                  <DialogDescription>
+                    Pick a repo and optionally describe a specific bug or task. Hermes opens a draft PR with its plan before writing any code.
+                  </DialogDescription>
+                </DialogHeader>
+                <div className="space-y-4 py-2">
+                  <div className="space-y-1.5">
+                    <label className="text-xs uppercase tracking-wider text-muted-foreground">Repository</label>
+                    <Select value={selectedRepo} onValueChange={setSelectedRepo}>
+                      <SelectTrigger><SelectValue placeholder="Choose a repo in The Forge" /></SelectTrigger>
+                      <SelectContent>
+                        {repos.map((r) => (
+                          <SelectItem key={r.id} value={r.id}>{r.full_name}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-1.5">
+                    <label className="text-xs uppercase tracking-wider text-muted-foreground">
+                      Bug report / instructions <span className="text-muted-foreground/60">(optional)</span>
+                    </label>
+                    <Textarea
+                      value={bugReport}
+                      onChange={(e) => setBugReport(e.target.value)}
+                      placeholder="e.g. The dice probability calculation returns wrong odds when rolling 3 or more dice. Should be much lower than what it shows."
+                      rows={5}
+                      className="resize-none"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Used to steer this loop in addition to your standing goals.
+                    </p>
+                  </div>
+                </div>
+                <DialogFooter>
+                  <Button variant="ghost" onClick={() => setDialogOpen(false)}>Cancel</Button>
+                  <Button
+                    onClick={() =>
+                      selectedRepo &&
+                      startMutation.mutate({
+                        repository_id: selectedRepo,
+                        bug_report: bugReport.trim() || undefined,
+                      })
+                    }
+                    disabled={!selectedRepo || startMutation.isPending}
+                    className="gap-2 ember-gradient text-primary-foreground border-0 shadow-[var(--shadow-ember)] hover:opacity-95"
+                  >
+                    <Flame className="size-4" /> {startMutation.isPending ? "Igniting…" : "Ignite loop"}
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
           )}
         </div>
       </div>
@@ -125,7 +200,7 @@ export function LoopControl() {
           ))}
           {activeLoop?.pr_url ? (
             <a href={activeLoop.pr_url} target="_blank" rel="noreferrer" className="mt-2 text-xs text-primary inline-flex items-center gap-1 hover:underline">
-              View PR <ExternalLink className="size-3" />
+              View draft PR #{activeLoop.pr_number} <ExternalLink className="size-3" />
             </a>
           ) : null}
         </div>

@@ -78,7 +78,7 @@ function DashboardHome() {
                 stars={0}
                 branch={r.default_branch}
                 isPrivate={r.private}
-                active={r.status === "running"}
+                added={r.status === "running"}
               />
             ))}
           </div>

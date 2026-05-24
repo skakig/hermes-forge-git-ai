@@ -15,6 +15,7 @@ import {
   recordInstallation,
 } from "@/lib/github-app.functions";
 import { listConnectedRepos } from "@/lib/dashboard.functions";
+import { InstallationHealthCard } from "@/components/forge/InstallationHealth";
 
 const PUBLISHED_HOST = "hermes-forge-git-ai.lovable.app";
 
@@ -231,6 +232,8 @@ function ReposPage() {
           ))}
         </div>
       ) : null}
+
+      {isConnected ? <InstallationHealthCard /> : null}
 
       {isConnected && repos.length > 0 ? (
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">

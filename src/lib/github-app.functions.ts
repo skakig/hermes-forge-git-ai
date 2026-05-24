@@ -168,3 +168,125 @@ export const recordInstallation = createServerFn({ method: "POST" })
     }
     return { ok: true as const, account_login: accountLogin };
   });
+
+// Health probe — verifies Hermes can (1) read the installation row,
+// (2) mint an installation access token via the App's private key/JWT,
+// and (3) call GitHub's /installation/repositories endpoint with that token.
+// Returns a structured result so the UI can show clear, actionable errors.
+export type InstallationHealth = {
+  ok: boolean;
+  checkedAt: string;
+  steps: {
+    record: { ok: boolean; message: string };
+    token: { ok: boolean; message: string };
+    repos: { ok: boolean; message: string; count?: number };
+  };
+  installation_id?: number;
+  account_login?: string;
+};
+
+export const checkInstallationHealth = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<InstallationHealth> => {
+    const checkedAt = new Date().toISOString();
+    const steps: InstallationHealth["steps"] = {
+      record: { ok: false, message: "Not checked" },
+      token: { ok: false, message: "Not checked" },
+      repos: { ok: false, message: "Not checked" },
+    };
+
+    const { data: install, error: dbErr } = await supabaseAdmin
+      .from("github_installations")
+      .select("installation_id, account_login")
+      .eq("user_id", context.userId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (dbErr) {
+      steps.record.message = `Database error: ${dbErr.message}`;
+      return { ok: false, checkedAt, steps };
+    }
+    if (!install) {
+      steps.record.message = "No GitHub App installation found for this account.";
+      return { ok: false, checkedAt, steps };
+    }
+    const installationId = Number(install.installation_id);
+    steps.record.ok = true;
+    steps.record.message = `Linked to installation #${installationId} (${install.account_login}).`;
+
+    let token: string;
+    try {
+      token = await getInstallationToken(installationId);
+      steps.token.ok = true;
+      steps.token.message = "Minted a fresh installation access token.";
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("missing_private_key")) {
+        steps.token.message = "GITHUB_APP_PRIVATE_KEY secret is not configured.";
+      } else if (msg.includes("missing_app_id")) {
+        steps.token.message = "GITHUB_APP_ID secret is not configured.";
+      } else if (msg.includes("installation_token_failed")) {
+        steps.token.message = `GitHub rejected the App JWT: ${msg.replace("installation_token_failed: ", "")}. The App may have been uninstalled or its private key rotated.`;
+      } else {
+        steps.token.message = `Token mint failed: ${msg}`;
+      }
+      return {
+        ok: false,
+        checkedAt,
+        steps,
+        installation_id: installationId,
+        account_login: install.account_login,
+      };
+    }
+
+    try {
+      const res = await fetch(
+        "https://api.github.com/installation/repositories?per_page=1",
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/vnd.github+json",
+            "User-Agent": "hermes-forge",
+          },
+        },
+      );
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        steps.repos.message = `GitHub returned ${res.status}: ${text.slice(0, 200) || res.statusText}`;
+        return {
+          ok: false,
+          checkedAt,
+          steps,
+          installation_id: installationId,
+          account_login: install.account_login,
+        };
+      }
+      const json = (await res.json()) as { total_count?: number; repositories?: unknown[] };
+      const count = json.total_count ?? json.repositories?.length ?? 0;
+      steps.repos.ok = true;
+      steps.repos.count = count;
+      steps.repos.message =
+        count > 0
+          ? `GitHub returned ${count} accessible repository${count === 1 ? "" : "ies"}.`
+          : "Connected, but the App has no repositories granted yet. Open GitHub → Settings → Applications and grant access.";
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      steps.repos.message = `Network error calling GitHub: ${msg}`;
+      return {
+        ok: false,
+        checkedAt,
+        steps,
+        installation_id: installationId,
+        account_login: install.account_login,
+      };
+    }
+
+    return {
+      ok: steps.record.ok && steps.token.ok && steps.repos.ok,
+      checkedAt,
+      steps,
+      installation_id: installationId,
+      account_login: install.account_login,
+    };
+  });

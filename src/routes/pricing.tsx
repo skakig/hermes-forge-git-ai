@@ -101,7 +101,7 @@ function PricingPage() {
                   </li>
                 ))}
               </ul>
-              <Link to="/dashboard/repos">
+              <Link to="/login" search={{ redirect: "/dashboard/repos" }}>
                 <Button
                   className={`w-full gap-2 ${tier.featured ? "ember-gradient text-primary-foreground border-0 shadow-[var(--shadow-ember)]" : ""}`}
                   variant={tier.featured ? "default" : "outline"}

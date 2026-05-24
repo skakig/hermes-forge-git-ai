@@ -17,10 +17,23 @@ function base64urlEncode(input: ArrayBuffer | Uint8Array | string): string {
 
 function pemToArrayBuffer(pem: string): ArrayBuffer {
   const clean = pem
-    .replace(/-----BEGIN [A-Z ]+-----/g, "")
-    .replace(/-----END [A-Z ]+-----/g, "")
+    .replace(/-----BEGIN [A-Z0-9 ]+-----/g, "")
+    .replace(/-----END [A-Z0-9 ]+-----/g, "")
     .replace(/\s+/g, "");
-  const binary = atob(clean);
+  // Only base64 chars allowed; reject anything else with a clear message.
+  if (!/^[A-Za-z0-9+/=]+$/.test(clean)) {
+    throw new Error(
+      "invalid_private_key: GITHUB_APP_PRIVATE_KEY contains non-base64 characters after stripping PEM armor. Re-paste the .pem file contents (including the BEGIN/END lines).",
+    );
+  }
+  let binary: string;
+  try {
+    binary = atob(clean);
+  } catch (e) {
+    throw new Error(
+      `invalid_private_key: base64 decode failed (${e instanceof Error ? e.message : String(e)}). The secret is likely truncated or wrapped with extra characters.`,
+    );
+  }
   const buf = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) buf[i] = binary.charCodeAt(i);
   return buf.buffer;
@@ -51,8 +64,22 @@ function pkcs1ToPkcs8(pkcs1: ArrayBuffer): ArrayBuffer {
 }
 
 async function importAppPrivateKey(): Promise<CryptoKey> {
-  const pem = process.env.GITHUB_APP_PRIVATE_KEY;
-  if (!pem) throw new Error("missing_private_key: GITHUB_APP_PRIVATE_KEY not set");
+  const rawSecret = process.env.GITHUB_APP_PRIVATE_KEY;
+  if (!rawSecret) throw new Error("missing_private_key: GITHUB_APP_PRIVATE_KEY not set");
+  // Normalize common paste variants:
+  //  - JSON-escaped newlines ("\\n")
+  //  - Surrounding quotes
+  //  - CRLF line endings
+  let pem = rawSecret.trim();
+  if ((pem.startsWith('"') && pem.endsWith('"')) || (pem.startsWith("'") && pem.endsWith("'"))) {
+    pem = pem.slice(1, -1);
+  }
+  pem = pem.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\r\n/g, "\n");
+  if (!/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/.test(pem)) {
+    throw new Error(
+      "invalid_private_key: GITHUB_APP_PRIVATE_KEY does not contain a PEM header. Paste the full contents of the .pem file downloaded from GitHub.",
+    );
+  }
   const raw = pemToArrayBuffer(pem);
   const isPkcs1 = /BEGIN RSA PRIVATE KEY/.test(pem);
   const der = isPkcs1 ? pkcs1ToPkcs8(raw) : raw;

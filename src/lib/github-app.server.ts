@@ -123,6 +123,60 @@ export type InstallationRepoDTO = {
   updated_at: string | null;
 };
 
+export type AppInstallationDTO = {
+  installation_id: number;
+  account_login: string;
+  account_type: string;
+  target_type: string;
+  app_slug: string;
+  repository_selection: string;
+};
+
+// Lists every installation of the App across all accounts.
+// Uses the App JWT (not an installation token).
+export async function listAllAppInstallations(): Promise<AppInstallationDTO[]> {
+  const jwt = await signAppJWT();
+  const out: AppInstallationDTO[] = [];
+  let page = 1;
+  while (true) {
+    const res = await fetch(
+      `https://api.github.com/app/installations?per_page=100&page=${page}`,
+      {
+        headers: {
+          Authorization: `Bearer ${jwt}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": "hermes-forge",
+        },
+      },
+    );
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`list_installations_failed: ${res.status} ${text}`);
+    }
+    const json = (await res.json()) as Array<{
+      id: number;
+      account: { login: string; type: string };
+      target_type: string;
+      app_slug: string;
+      repository_selection: string;
+    }>;
+    for (const i of json) {
+      out.push({
+        installation_id: i.id,
+        account_login: i.account?.login ?? "unknown",
+        account_type: i.account?.type ?? "User",
+        target_type: i.target_type,
+        app_slug: i.app_slug,
+        repository_selection: i.repository_selection,
+      });
+    }
+    if (json.length < 100) break;
+    page++;
+    if (page > 10) break;
+  }
+  return out;
+}
+
 export async function fetchInstallationRepos(
   installationId: number,
 ): Promise<InstallationRepoDTO[]> {

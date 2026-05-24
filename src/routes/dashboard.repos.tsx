@@ -6,18 +6,21 @@ import { toast } from "sonner";
 import { RepoCard } from "@/components/forge/RepoCard";
 import { Button } from "@/components/ui/button";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { AlertCircle, CheckCircle2, ExternalLink, Github, Plus, RefreshCw, Check } from "lucide-react";
+import { AlertCircle, CheckCircle2, ExternalLink, Github, Plus, RefreshCw, Check, Link2 } from "lucide-react";
 import { startGithubOAuth } from "@/lib/github-oauth.functions";
 import {
   getGithubConnection,
   listInstallationRepos,
   addRepoToForge,
   recordInstallation,
+  listAppInstallations,
+  claimInstallation,
 } from "@/lib/github-app.functions";
 import { listConnectedRepos } from "@/lib/dashboard.functions";
 import { InstallationHealthCard } from "@/components/forge/InstallationHealth";
 
 const PUBLISHED_HOST = "hermes-forge-git-ai.lovable.app";
+const PENDING_INSTALL_KEY = "hermes:pending_install_id";
 
 const ERROR_MESSAGES: Record<string, string> = {
   missing_installation: "GitHub didn't send an installation ID back. Try installing again.",
@@ -50,11 +53,15 @@ function ReposPage() {
   const fetchConnected = useServerFn(listConnectedRepos);
   const addRepo = useServerFn(addRepoToForge);
   const recordInstall = useServerFn(recordInstallation);
+  const listInstallations = useServerFn(listAppInstallations);
+  const claimInstall = useServerFn(claimInstallation);
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const { installed, error, pending_install } = Route.useSearch();
   const [loading, setLoading] = useState(false);
   const [isPreviewHost, setIsPreviewHost] = useState(false);
+  const [stashedPending, setStashedPending] = useState<number | null>(null);
+  const [showReconcile, setShowReconcile] = useState(false);
 
   const connectionQuery = useQuery({
     queryKey: ["github", "connection"],
@@ -101,24 +108,50 @@ function ReposPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Finish the App install flow: GitHub redirected to /auth/github/callback,
-  // which bounced us here with ?pending_install=<id>. Record it now under the
-  // authenticated user.
+  // Finish the App install flow. The id can arrive two ways:
+  // 1. ?pending_install=<id> on this exact navigation
+  // 2. Stashed in sessionStorage from a prior tab that lost auth
+  // Stash first so a reload or auth bounce doesn't drop it, then attempt
+  // to record it under the authenticated user.
   useEffect(() => {
-    if (!pending_install || !Number.isFinite(pending_install)) return;
+    if (typeof window === "undefined") return;
+    let id: number | null = null;
+    if (pending_install && Number.isFinite(pending_install)) {
+      id = pending_install;
+      try {
+        sessionStorage.setItem(PENDING_INSTALL_KEY, String(pending_install));
+      } catch {
+        /* ignore */
+      }
+    } else {
+      const raw = sessionStorage.getItem(PENDING_INSTALL_KEY);
+      const parsed = raw ? Number(raw) : NaN;
+      if (Number.isFinite(parsed) && parsed > 0) id = parsed;
+    }
+    if (!id) return;
+    setStashedPending(id);
     let cancelled = false;
     (async () => {
       try {
-        await recordInstall({ data: { installation_id: pending_install } });
+        await recordInstall({ data: { installation_id: id! } });
         if (cancelled) return;
+        try {
+          sessionStorage.removeItem(PENDING_INSTALL_KEY);
+        } catch {
+          /* ignore */
+        }
+        setStashedPending(null);
         toast.success("GitHub App installed — Hermes can now reach your repositories.");
         queryClient.invalidateQueries({ queryKey: ["github"] });
-        navigate({ to: "/dashboard/repos", search: {}, replace: true });
+        if (pending_install) {
+          navigate({ to: "/dashboard/repos", search: {}, replace: true });
+        }
       } catch (e) {
         console.error(e);
         if (cancelled) return;
+        // Keep the stash so the recovery card stays visible and the user
+        // can retry without re-running the GitHub flow.
         toast.error(e instanceof Error ? e.message : "Failed to record installation");
-        navigate({ to: "/dashboard/repos", search: { error: "record_failed" }, replace: true });
       }
     })();
     return () => {
@@ -151,6 +184,44 @@ function ReposPage() {
   const repos = reposQuery.data?.repos ?? [];
   const connectedIds = new Set((connectedQuery.data?.repos ?? []).map((r) => r.full_name));
 
+  const reconcileQuery = useQuery({
+    queryKey: ["github", "reconcile"],
+    queryFn: () => listInstallations(),
+    enabled: showReconcile,
+    staleTime: 0,
+  });
+
+  const retryRecord = useMutation({
+    mutationFn: (id: number) => recordInstall({ data: { installation_id: id } }),
+    onSuccess: () => {
+      try {
+        sessionStorage.removeItem(PENDING_INSTALL_KEY);
+      } catch {
+        /* ignore */
+      }
+      setStashedPending(null);
+      toast.success("Installation linked.");
+      queryClient.invalidateQueries({ queryKey: ["github"] });
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "Retry failed"),
+  });
+
+  const claimMut = useMutation({
+    mutationFn: (id: number) => claimInstall({ data: { installation_id: id } }),
+    onSuccess: () => {
+      toast.success("Installation linked to your account.");
+      setShowReconcile(false);
+      try {
+        sessionStorage.removeItem(PENDING_INSTALL_KEY);
+      } catch {
+        /* ignore */
+      }
+      setStashedPending(null);
+      queryClient.invalidateQueries({ queryKey: ["github"] });
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "Could not claim installation"),
+  });
+
   return (
     <div className="max-w-7xl mx-auto space-y-6">
       {error ? (
@@ -163,6 +234,45 @@ function ReposPage() {
           </AlertDescription>
         </Alert>
       ) : null}
+
+      {/* Recovery card: we have a pending install ID but no installation row yet. */}
+      {stashedPending && !installation ? (
+        <Alert>
+          <AlertCircle className="size-4" />
+          <AlertTitle>Finish GitHub App install</AlertTitle>
+          <AlertDescription className="space-y-2">
+            <p>
+              GitHub sent us installation <code>#{stashedPending}</code>, but we couldn't link it to your account yet.
+            </p>
+            <div className="flex gap-2">
+              <Button
+                size="sm"
+                onClick={() => retryRecord.mutate(stashedPending)}
+                disabled={retryRecord.isPending}
+                className="gap-2"
+              >
+                <RefreshCw className={`size-3.5 ${retryRecord.isPending ? "animate-spin" : ""}`} />
+                {retryRecord.isPending ? "Linking…" : "Retry link"}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  try {
+                    sessionStorage.removeItem(PENDING_INSTALL_KEY);
+                  } catch {
+                    /* ignore */
+                  }
+                  setStashedPending(null);
+                }}
+              >
+                Dismiss
+              </Button>
+            </div>
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
       {installed === "1" ? (
         <Alert className="border-emerald-500/40 text-emerald-400">
           <CheckCircle2 className="size-4" />
@@ -205,11 +315,94 @@ function ReposPage() {
             Refresh
           </Button>
         ) : (
-          <Button onClick={connect} disabled={loading} className="ember-gradient text-primary-foreground border-0 gap-2">
-            <Plus className="size-4" /> {loading ? "Redirecting…" : "Install GitHub App"}
-          </Button>
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setShowReconcile((v) => !v)}
+              className="gap-2"
+            >
+              <Link2 className="size-4" /> Re-sync from GitHub
+            </Button>
+            <Button onClick={connect} disabled={loading} className="ember-gradient text-primary-foreground border-0 gap-2">
+              <Plus className="size-4" /> {loading ? "Redirecting…" : "Install GitHub App"}
+            </Button>
+          </div>
         )}
       </div>
+
+      {/* Reconcile panel: lists every installation the App can see and lets the
+          user claim one. Useful when the redirect handoff failed. */}
+      {showReconcile ? (
+        <div className="rounded-xl border border-border/60 glass p-5 space-y-3">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className="font-display text-lg">App installations</div>
+              <div className="text-sm text-muted-foreground">
+                If you already installed the Hermes Forge GitHub App, pick the
+                account/org it was installed on to link it to your Hermes account.
+              </div>
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => reconcileQuery.refetch()}
+              disabled={reconcileQuery.isFetching}
+              className="gap-2"
+            >
+              <RefreshCw className={`size-3.5 ${reconcileQuery.isFetching ? "animate-spin" : ""}`} />
+              Refresh
+            </Button>
+          </div>
+          {reconcileQuery.isLoading ? (
+            <div className="text-sm text-muted-foreground">Loading installations…</div>
+          ) : reconcileQuery.data?.error ? (
+            <div className="text-sm text-destructive">
+              Couldn't list installations: {reconcileQuery.data.error}
+            </div>
+          ) : (reconcileQuery.data?.installations.length ?? 0) === 0 ? (
+            <div className="text-sm text-muted-foreground">
+              No installations found. Install the GitHub App first, then come
+              back here.
+            </div>
+          ) : (
+            <ul className="divide-y divide-border/60">
+              {reconcileQuery.data!.installations.map((i) => {
+                const claimedByOther =
+                  reconcileQuery.data!.already_claimed_ids.includes(i.installation_id);
+                const me = reconcileQuery.data!.github_username;
+                const suggested = !!me && me.toLowerCase() === i.account_login.toLowerCase();
+                return (
+                  <li key={i.installation_id} className="py-3 flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="font-medium text-sm flex items-center gap-2">
+                        {i.account_login}
+                        <span className="text-xs text-muted-foreground">({i.account_type})</span>
+                        {suggested ? (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/15 text-primary border border-primary/30">
+                            matches your GitHub
+                          </span>
+                        ) : null}
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        installation #{i.installation_id} · {i.repository_selection} access
+                      </div>
+                    </div>
+                    <Button
+                      size="sm"
+                      variant={suggested ? "default" : "outline"}
+                      disabled={claimMut.isPending || claimedByOther}
+                      onClick={() => claimMut.mutate(i.installation_id)}
+                    >
+                      {claimedByOther ? "Linked elsewhere" : "Link to my account"}
+                    </Button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      ) : null}
+
       {showInstallCard ? (
         <div className="rounded-xl border border-primary/30 glass p-6 flex items-center gap-4">
           <div className="size-12 rounded-lg ember-gradient grid place-items-center text-primary-foreground"><Github className="size-5" /></div>

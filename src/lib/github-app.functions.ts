@@ -2,7 +2,13 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
-import { fetchInstallationRepos, getInstallationToken, type InstallationRepoDTO } from "./github-app.server";
+import {
+  fetchInstallationRepos,
+  getInstallationToken,
+  listAllAppInstallations,
+  type AppInstallationDTO,
+  type InstallationRepoDTO,
+} from "./github-app.server";
 
 export const getGithubConnection = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
@@ -167,6 +173,87 @@ export const recordInstallation = createServerFn({ method: "POST" })
       throw new Error(error.message);
     }
     return { ok: true as const, account_login: accountLogin };
+  });
+
+// Reconcile: list every installation the App itself can see (via App JWT),
+// optionally filtered to the ones whose account.login matches the current
+// user's github_username. This is the fallback when the install-redirect
+// handoff lost the `installation_id` (user wasn't logged in, browser
+// killed the tab, GitHub didn't forward it, etc).
+export const listAppInstallations = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { data: profile } = await supabaseAdmin
+      .from("profiles")
+      .select("github_username")
+      .eq("user_id", context.userId)
+      .maybeSingle();
+    const githubUsername = profile?.github_username ?? null;
+
+    let all: AppInstallationDTO[] = [];
+    try {
+      all = await listAllAppInstallations();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error("[list-app-installations] failed", msg);
+      return {
+        installations: [] as AppInstallationDTO[],
+        already_claimed_ids: [] as number[],
+        github_username: githubUsername,
+        error: msg,
+      };
+    }
+
+    const { data: claimed } = await supabaseAdmin
+      .from("github_installations")
+      .select("installation_id, user_id");
+    const claimedSet = new Set(
+      (claimed ?? []).map((c) => Number(c.installation_id)),
+    );
+
+    return {
+      installations: all,
+      already_claimed_ids: Array.from(claimedSet),
+      github_username: githubUsername,
+      error: null as string | null,
+    };
+  });
+
+export const claimInstallation = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) =>
+    z.object({ installation_id: z.number().int().positive() }).parse(input),
+  )
+  .handler(async ({ context, data }) => {
+    // Refuse to steal an installation already linked to a different user.
+    const { data: existing } = await supabaseAdmin
+      .from("github_installations")
+      .select("user_id")
+      .eq("installation_id", data.installation_id)
+      .maybeSingle();
+    if (existing && existing.user_id !== context.userId) {
+      throw new Error("installation_already_claimed");
+    }
+
+    // Verify the App can still see this installation and grab its account.
+    const all = await listAllAppInstallations();
+    const match = all.find((i) => i.installation_id === data.installation_id);
+    if (!match) throw new Error("installation_not_found");
+
+    const { error } = await supabaseAdmin
+      .from("github_installations")
+      .upsert(
+        {
+          user_id: context.userId,
+          installation_id: data.installation_id,
+          account_login: match.account_login,
+          account_type: match.account_type,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id,installation_id" },
+      );
+    if (error) throw new Error(error.message);
+    return { ok: true as const, account_login: match.account_login };
   });
 
 // Health probe — verifies Hermes can (1) read the installation row,

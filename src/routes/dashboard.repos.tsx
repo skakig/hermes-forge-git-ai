@@ -1,27 +1,31 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
 import { useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { RepoCard } from "@/components/forge/RepoCard";
 import { Button } from "@/components/ui/button";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { AlertCircle, CheckCircle2, ExternalLink, Github, Plus, RefreshCw } from "lucide-react";
-import { startGithubOAuth, listGithubRepos } from "@/lib/github-oauth.functions";
+import { AlertCircle, CheckCircle2, ExternalLink, Github, Plus, RefreshCw, Check } from "lucide-react";
+import { startGithubOAuth } from "@/lib/github-oauth.functions";
+import { getGithubConnection, listInstallationRepos, addRepoToForge } from "@/lib/github-app.functions";
+import { listConnectedRepos } from "@/lib/dashboard.functions";
 
 const PUBLISHED_HOST = "hermes-forge-git-ai.lovable.app";
 
 const ERROR_MESSAGES: Record<string, string> = {
-  missing_code: "GitHub didn't return an authorization code. Try again, or check that the GitHub OAuth App is active.",
-  bad_state: "The sign-in request expired or was tampered with. Start the flow again — it must complete within 10 minutes.",
-  token_exchange: "GitHub rejected the token exchange. The OAuth App's client secret may be wrong, or the callback URL doesn't match exactly.",
-  store: "We got your GitHub token but couldn't save it. Check the server logs for the database error.",
-  missing_app_slug: "Your GitHub credentials are for a GitHub App, but the app's public slug isn't configured yet. Add the GITHUB_APP_SLUG secret (the URL slug from https://github.com/apps/<slug>) and try again.",
+  missing_installation: "GitHub didn't send an installation ID back. Try installing again.",
+  bad_installation: "GitHub returned an invalid installation ID.",
+  missing_state: "The install request was missing its signed state. Start the install from the dashboard, not directly from GitHub.",
+  bad_state: "The install request expired or was tampered with. Start it again — it must complete within 30 minutes.",
+  install_pending: "Your org admin needs to approve the GitHub App install before Hermes can connect.",
+  store: "We received the installation but couldn't save it. Check the server logs.",
+  missing_app_slug: "The GitHub App slug isn't configured. Add the GITHUB_APP_SLUG secret.",
 };
 
 export const Route = createFileRoute("/dashboard/repos")({
   validateSearch: (search: Record<string, unknown>) => ({
-    connected: search.connected === "1" ? "1" as const : undefined,
+    installed: search.installed === "1" ? ("1" as const) : undefined,
     error: typeof search.error === "string" ? search.error : undefined,
   }),
   component: ReposPage,
@@ -29,16 +33,42 @@ export const Route = createFileRoute("/dashboard/repos")({
 
 function ReposPage() {
   const startOAuth = useServerFn(startGithubOAuth);
-  const fetchRepos = useServerFn(listGithubRepos);
+  const fetchInstallationRepos = useServerFn(listInstallationRepos);
+  const fetchConnection = useServerFn(getGithubConnection);
+  const fetchConnected = useServerFn(listConnectedRepos);
+  const addRepo = useServerFn(addRepoToForge);
+  const queryClient = useQueryClient();
   const navigate = useNavigate();
-  const { connected, error } = Route.useSearch();
+  const { installed, error } = Route.useSearch();
   const [loading, setLoading] = useState(false);
   const [isPreviewHost, setIsPreviewHost] = useState(false);
 
+  const connectionQuery = useQuery({
+    queryKey: ["github", "connection"],
+    queryFn: () => fetchConnection(),
+    staleTime: 30_000,
+  });
   const reposQuery = useQuery({
-    queryKey: ["github", "repos"],
-    queryFn: () => fetchRepos(),
+    queryKey: ["github", "installation-repos"],
+    queryFn: () => fetchInstallationRepos(),
+    enabled: !!connectionQuery.data?.installation,
     staleTime: 60_000,
+  });
+  const connectedQuery = useQuery({
+    queryKey: ["forge", "connected-repos"],
+    queryFn: () => fetchConnected(),
+    staleTime: 10_000,
+  });
+
+  const addMutation = useMutation({
+    mutationFn: (vars: { github_id: number; full_name: string; name: string; owner: string; private: boolean; default_branch: string }) =>
+      addRepo({ data: vars }),
+    onSuccess: (res) => {
+      if (res.added) toast.success("Repo added to The Forge");
+      else toast.info("Already in The Forge");
+      queryClient.invalidateQueries({ queryKey: ["forge", "connected-repos"] });
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "Failed to add repo"),
   });
 
   useEffect(() => {
@@ -48,10 +78,11 @@ function ReposPage() {
   }, []);
 
   useEffect(() => {
-    if (connected === "1") {
-      toast.success("GitHub connected — Hermes can now reach your repositories.");
+    if (installed === "1") {
+      toast.success("GitHub App installed — Hermes can now reach your repositories.");
+      queryClient.invalidateQueries({ queryKey: ["github"] });
     }
-    if (connected || error) {
+    if (installed || error) {
       navigate({ to: "/dashboard/repos", search: {}, replace: true });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -75,9 +106,11 @@ function ReposPage() {
     }
   };
 
-  const data = reposQuery.data;
-  const isConnected = !!data && !data.notConnected && !data.tokenInvalid;
-  const showInstallCard = !data || data.notConnected || data.tokenInvalid;
+  const installation = connectionQuery.data?.installation ?? null;
+  const isConnected = !!installation;
+  const showInstallCard = !connectionQuery.isLoading && !installation;
+  const repos = reposQuery.data?.repos ?? [];
+  const connectedIds = new Set((connectedQuery.data?.repos ?? []).map((r) => r.full_name));
 
   return (
     <div className="max-w-7xl mx-auto space-y-6">
@@ -118,8 +151,8 @@ function ReposPage() {
           <h1 className="font-display text-3xl">Repositories</h1>
           <p className="text-sm text-muted-foreground mt-1">
             {isConnected
-              ? `Showing ${data?.repos.length ?? 0} repositories from your GitHub account.`
-              : "Connect any GitHub repo for the agent to forge."}
+              ? `${repos.length} repositories accessible · ${connectedIds.size} added to The Forge`
+              : "Install the Hermes Forge GitHub App to start forging."}
           </p>
         </div>
         {isConnected ? (
@@ -134,7 +167,7 @@ function ReposPage() {
           </Button>
         ) : (
           <Button onClick={connect} disabled={loading} className="ember-gradient text-primary-foreground border-0 gap-2">
-            <Plus className="size-4" /> {loading ? "Redirecting…" : "Connect repo"}
+            <Plus className="size-4" /> {loading ? "Redirecting…" : "Install GitHub App"}
           </Button>
         )}
       </div>
@@ -142,22 +175,18 @@ function ReposPage() {
         <div className="rounded-xl border border-primary/30 glass p-6 flex items-center gap-4">
           <div className="size-12 rounded-lg ember-gradient grid place-items-center text-primary-foreground"><Github className="size-5" /></div>
           <div className="flex-1">
-            <div className="font-display text-lg">
-              {data?.tokenInvalid ? "Reconnect GitHub" : "Connect your GitHub account"}
-            </div>
+            <div className="font-display text-lg">Install the Hermes Forge GitHub App</div>
             <div className="text-sm text-muted-foreground">
-              {data?.tokenInvalid
-                ? "Your previous GitHub token was revoked or expired. Reconnect to keep forging."
-                : "Grant the agent the access it needs to read your repositories and open pull requests."}
+              On the next screen, pick which repositories Hermes can read, refactor, and open PRs against. You can change this anytime in GitHub settings.
             </div>
           </div>
           <Button variant="outline" onClick={connect} disabled={loading}>
-            {loading ? "Redirecting…" : data?.tokenInvalid ? "Reconnect" : "Connect"}
+            {loading ? "Redirecting…" : "Install"}
           </Button>
         </div>
       ) : null}
 
-      {reposQuery.isLoading ? (
+      {isConnected && reposQuery.isLoading ? (
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {Array.from({ length: 6 }).map((_, i) => (
             <div key={i} className="rounded-xl border border-border/60 glass p-4 h-24 animate-pulse" />
@@ -165,23 +194,46 @@ function ReposPage() {
         </div>
       ) : null}
 
-      {isConnected && data && data.repos.length > 0 ? (
+      {isConnected && repos.length > 0 ? (
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {data.repos.map((r) => (
-            <RepoCard
-              key={r.id}
-              name={r.full_name}
-              stars={r.stargazers_count}
-              branch={r.default_branch}
-              isPrivate={r.private}
-            />
-          ))}
+          {repos.map((r) => {
+            const alreadyAdded = connectedIds.has(r.full_name);
+            return (
+              <div key={r.id} className="space-y-2">
+                <RepoCard
+                  name={r.full_name}
+                  stars={r.stargazers_count}
+                  branch={r.default_branch}
+                  isPrivate={r.private}
+                  active={alreadyAdded}
+                />
+                <Button
+                  size="sm"
+                  variant={alreadyAdded ? "outline" : "default"}
+                  className="w-full gap-2"
+                  disabled={alreadyAdded || addMutation.isPending}
+                  onClick={() =>
+                    addMutation.mutate({
+                      github_id: r.id,
+                      full_name: r.full_name,
+                      name: r.name,
+                      owner: r.owner,
+                      private: r.private,
+                      default_branch: r.default_branch,
+                    })
+                  }
+                >
+                  {alreadyAdded ? (<><Check className="size-3" /> In The Forge</>) : (<><Plus className="size-3" /> Add to Hermes</>)}
+                </Button>
+              </div>
+            );
+          })}
         </div>
       ) : null}
 
-      {isConnected && data && data.repos.length === 0 ? (
+      {isConnected && !reposQuery.isLoading && repos.length === 0 ? (
         <div className="rounded-xl border border-border/60 glass p-8 text-center text-sm text-muted-foreground">
-          No repositories found on your GitHub account yet.
+          The GitHub App has no repositories yet. Open the app settings on GitHub and grant it access to at least one repo.
         </div>
       ) : null}
     </div>

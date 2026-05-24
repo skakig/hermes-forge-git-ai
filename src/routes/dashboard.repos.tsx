@@ -363,39 +363,87 @@ function ReposPage() {
           </AlertDescription>
         </Alert>
       ) : null}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="font-display text-3xl">Repositories</h1>
-          <p className="text-sm text-muted-foreground mt-1">
-            {isConnected
-              ? `${repos.length} repositories accessible · ${connectedIds.size} added to The Forge`
-              : "Install the Hermes Forge GitHub App to start forging."}
-          </p>
+      <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
+        <div className="space-y-1.5">
+          <h1 className="font-display text-3xl md:text-4xl uppercase tracking-[0.18em] text-foreground">
+            Repositories
+          </h1>
+          {isConnected ? (
+            <div className="flex items-center gap-3 text-sm text-muted-foreground">
+              <span className="flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-primary" />
+                {repos.length} total
+              </span>
+              <span className="w-1 h-1 rounded-full bg-border" />
+              <span>{connectedIds.size} in the forge</span>
+              {hasActiveFilter ? (
+                <>
+                  <span className="w-1 h-1 rounded-full bg-border" />
+                  <span className="text-foreground">
+                    {visibleRepos.length} match{visibleRepos.length === 1 ? "" : "es"}
+                  </span>
+                </>
+              ) : null}
+            </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              Install the Hermes Forge GitHub App to start forging.
+            </p>
+          )}
         </div>
-        {isConnected ? (
-          <Button
-            variant="outline"
-            onClick={() => reposQuery.refetch()}
-            disabled={reposQuery.isFetching}
-            className="gap-2"
-          >
-            <RefreshCw className={`size-4 ${reposQuery.isFetching ? "animate-spin" : ""}`} />
-            Refresh
-          </Button>
-        ) : (
-          <div className="flex gap-2">
-            <Button
-              variant="outline"
-              onClick={() => setShowReconcile((v) => !v)}
-              className="gap-2"
-            >
-              <Link2 className="size-4" /> Re-sync from GitHub
-            </Button>
-            <Button onClick={connect} disabled={loading} className="ember-gradient text-primary-foreground border-0 gap-2">
-              <Plus className="size-4" /> {loading ? "Redirecting…" : "Install GitHub App"}
-            </Button>
-          </div>
-        )}
+        <div className="flex items-center gap-2">
+          {isConnected ? (
+            <>
+              <div className="hidden md:flex bg-white/5 p-1 rounded-lg border border-border/60">
+                <button
+                  onClick={() => setView("grid")}
+                  className={cn(
+                    "px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 transition-colors",
+                    view === "grid"
+                      ? "bg-white/10 text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  <LayoutGrid className="w-3.5 h-3.5" /> Grid
+                </button>
+                <button
+                  onClick={() => setView("dense")}
+                  className={cn(
+                    "px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 transition-colors",
+                    view === "dense"
+                      ? "bg-white/10 text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  <List className="w-3.5 h-3.5" /> Dense
+                </button>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => reposQuery.refetch()}
+                disabled={reposQuery.isFetching}
+                className="gap-2"
+              >
+                <RefreshCw className={cn("size-3.5", reposQuery.isFetching && "animate-spin")} />
+                Refresh
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button
+                variant="outline"
+                onClick={() => setShowReconcile((v) => !v)}
+                className="gap-2"
+              >
+                <Link2 className="size-4" /> Re-sync from GitHub
+              </Button>
+              <Button onClick={connect} disabled={loading} className="ember-gradient text-primary-foreground border-0 gap-2">
+                <Plus className="size-4" /> {loading ? "Redirecting…" : "Install GitHub App"}
+              </Button>
+            </>
+          )}
+        </div>
       </div>
 
       {/* Reconcile panel: lists every installation the App can see and lets the

@@ -124,11 +124,11 @@ function ReposPage() {
           </AlertDescription>
         </Alert>
       ) : null}
-      {connected === "1" ? (
+      {installed === "1" ? (
         <Alert className="border-emerald-500/40 text-emerald-400">
           <CheckCircle2 className="size-4" />
-          <AlertTitle>Connected</AlertTitle>
-          <AlertDescription>Your GitHub account is linked. Pick a repository below to start forging.</AlertDescription>
+          <AlertTitle>Installed</AlertTitle>
+          <AlertDescription>The GitHub App is installed. Pick a repository below to add it to The Forge.</AlertDescription>
         </Alert>
       ) : null}
       {isPreviewHost && showInstallCard ? (

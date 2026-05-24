@@ -1,50 +1,43 @@
-## Mission
-Turn the marketing surface into a sellable product: real, distinct pages for **How it works**, **Features**, **Pricing**, plus a fixed **Connect a repository** CTA — all rendered in the existing cyber-desert / ember aesthetic at flagship-launch quality.
+# Make the primary CTAs actually work
 
-## Pages to ship
+## The problem
 
-### 1. `/` — Landing (refined)
-- Nav links rewired from `#how / #features / #pricing` (anchors that don't exist) to real routes `/how-it-works`, `/features`, `/pricing`.
-- "Connect a repository" CTA → routes to `/dashboard/repos` (unauth users land on the sign-in screen first, then bounce to repos where the working OAuth button lives).
-- Tighten the hero, add a "trusted by repos like" strip, an animated "loop" visualization band, and a final CTA section above the footer.
+"Ignite the Forge" and "Connect a repository" both link to `/dashboard/repos`. That route's parent (`src/routes/dashboard.tsx`) guards with `supabase.auth.getSession()` and, when there's no session, redirects to `/?redirect=/dashboard/repos`. The homepage has no sign-in UI, so the user lands on the marketing page again and the CTAs appear broken. There is no `/login` route in the app at all.
 
-### 2. `/how-it-works` (new route)
-Four-step ritual narrative — **Connect → Audit → Forge → Ship**. Each step gets:
-- A large numbered glyph and ember-accented heading
-- A short prose explanation
-- A mini "what happens" panel (e.g. tree of files being audited, diff being written, PR being opened)
-- A vertical ember timeline connecting all four steps with rune-grid backdrop
-Closes with a CTA card → "Ignite the Forge".
+## What I'll build
 
-### 3. `/features` (new route)
-Twelve+ capability cards across three groups:
-- **Autonomy** — background loops, goal alignment, multi-repo, scheduling
-- **Craftsmanship** — clean branches, reasoned commits, critique reports, content QA
-- **Trust & control** — scoped GitHub auth, PR-only writes, audit log, kill switch
-Hero band uses a bento-grid layout (mixed sizes) so it feels editorial, not stock-cards.
+### 1. New `/login` route (`src/routes/login.tsx`)
+- Polished card matching the cyber-desert aesthetic (glass surface, ember accents, rune-grid backdrop).
+- Tabs: **Sign in** and **Create account**.
+- Email + password form using `supabase.auth.signInWithPassword` / `signUp`.
+- "Continue with Google" button using `lovable.auth.signInWithOAuth("google", { redirect_uri: window.location.origin + "/login" })` (managed Lovable Cloud OAuth — no extra setup).
+- Reads `?redirect=` search param; after successful auth navigates to that path (default `/dashboard/repos`).
+- If already authenticated (`beforeLoad` session check), immediately redirect to the target.
+- Inline error messaging via toast + form-level message.
+- SEO `head()` with route-specific title/description.
 
-### 4. `/pricing` (new route)
-Three tiers in a desert-temple layout (center plan elevated):
-- **Apprentice** — Free · 1 repo · 5 loops/mo · community goals
-- **Forgemaster** — $29/mo · 10 repos · unlimited loops · priority queue · background mode
-- **Sovereign** — $99/mo · unlimited repos · custom goals · SSO · audit export · priority support
-Each card: feature checklist, plan-specific accent ring, "Start" button → `/dashboard/repos`. Below: short FAQ accordion (Stripe note: "Billing not wired yet — buttons route to onboarding").
+### 2. New `/signup` route
+- Thin wrapper that renders the same component pre-switched to the Create account tab, so the marketing nav can offer both entry points cleanly. (Same file, shared component.)
 
-## Shared chrome
-- Extract the marketing header + footer into `src/components/marketing/MarketingShell.tsx` so all four public pages share identical nav with active states (TanStack `<Link>` + `activeProps`).
-- Nav items: Home / How it works / Features / Pricing + right-side **Sign in** and ember **Ignite the Forge**.
+### 3. Wire CTAs through `/login`
+- `src/routes/dashboard.tsx` `beforeLoad`: redirect unauthenticated users to `/login?redirect=<location.href>` instead of `/`.
+- `src/components/marketing/MarketingShell.tsx`:
+  - "Sign in" button → `/login`.
+  - "Ignite the Forge" button → `/login?redirect=/dashboard/repos` (so a fresh visitor signs in and lands directly on the connect-repo screen).
+- `src/routes/index.tsx`: same treatment for the hero "Ignite the Forge" / "Connect a repository" CTAs and the final-CTA band.
+- `src/routes/pricing.tsx`: tier "Start" buttons → `/login?redirect=/dashboard/repos`.
 
-## Visual system (no token drift)
-Reuse existing tokens only: `ember-gradient`, `glass`, `rune-grid`, `text-glow`, `shadow-ember`, `drift`, `font-display`. Each page gets one distinct hero motif so they feel like a series, not a copy:
-- How it works → vertical ember spine
-- Features → bento grid w/ glowing rune corners
-- Pricing → three obelisks rising from sand glow
+### 4. Configure Google as a social provider
+- Call `supabase--configure_social_auth` with `providers: ["google"]` so the first Google sign-in doesn't fail with "provider not enabled". No keys required from the user (managed by Lovable Cloud).
 
-## SEO
-Per-page `head()` with unique title, description, og:title, og:description (route-architecture rule).
+### 5. Auth state listener
+- Small `useEffect` in the login component subscribing to `supabase.auth.onAuthStateChange` to navigate on `SIGNED_IN` (covers the OAuth return trip).
 
-## Technical notes
-- New route files: `src/routes/how-it-works.tsx`, `src/routes/features.tsx`, `src/routes/pricing.tsx`.
-- New component: `src/components/marketing/MarketingShell.tsx` (header + footer + outlet-style children).
-- `src/routes/index.tsx` updated to use MarketingShell and fixed CTAs.
-- No backend changes; no new dependencies.
+## Out of scope
+- No changes to the GitHub OAuth flow itself, the Hermes API wrapper, or any dashboard pages beyond the redirect target. The GitHub "Connect repo" button on `/dashboard/repos` is already wired and will work the moment the user has a session.
+- No password reset / email verification UI in this pass (email confirmation remains the Supabase default; if you want auto-confirm during testing, say the word).
+
+## Files touched
+- **New:** `src/routes/login.tsx`, `src/routes/signup.tsx`
+- **Edited:** `src/routes/dashboard.tsx`, `src/components/marketing/MarketingShell.tsx`, `src/routes/index.tsx`, `src/routes/pricing.tsx`
+- **Config:** enable Google social auth provider

@@ -72,14 +72,18 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "Lovable App" },
-      { name: "description", content: "Lovable Generated Project" },
+      { title: "Hermes Forge Agent" },
+      { name: "description", content: "Agentic self-improvement operator. Improve your repo, while you sleep." },
       { name: "author", content: "Lovable" },
-      { property: "og:title", content: "Lovable App" },
-      { property: "og:description", content: "Lovable Generated Project" },
+      { property: "og:title", content: "Hermes Forge Agent" },
+      { property: "og:description", content: "Agentic self-improvement operator. Improve your repo, while you sleep." },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary" },
       { name: "twitter:site", content: "@Lovable" },
+      { name: "twitter:title", content: "Hermes Forge Agent" },
+      { name: "twitter:description", content: "Agentic self-improvement operator. Improve your repo, while you sleep." },
+      { property: "og:image", content: "https://storage.googleapis.com/gpt-engineer-file-uploads/X8KRxlcvyARp2CCH5e8jc9n17Z32/social-images/social-1779651201566-IMG_1081.webp" },
+      { name: "twitter:image", content: "https://storage.googleapis.com/gpt-engineer-file-uploads/X8KRxlcvyARp2CCH5e8jc9n17Z32/social-images/social-1779651201566-IMG_1081.webp" },
     ],
     links: [
       {

@@ -107,6 +107,8 @@ function ReposPage() {
   const addMutation = useMutation({
     mutationFn: (vars: { github_id: number; full_name: string; name: string; owner: string; private: boolean; default_branch: string }) =>
       addRepo({ data: vars }),
+    onMutate: (vars) => setPendingRepoId(vars.github_id),
+    onSettled: () => setPendingRepoId(null),
     onSuccess: (res) => {
       if (res.added) toast.success("Repo added to The Forge");
       else toast.info("Already in The Forge");
@@ -119,6 +121,22 @@ function ReposPage() {
     if (typeof window !== "undefined") {
       setIsPreviewHost(!window.location.hostname.endsWith(PUBLISHED_HOST));
     }
+  }, []);
+
+  // Global ⌘K / Ctrl+K → focus the repo search input. Esc clears it.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        searchRef.current?.focus();
+        searchRef.current?.select();
+      } else if (e.key === "Escape" && document.activeElement === searchRef.current) {
+        setQuery("");
+        searchRef.current?.blur();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
 
   useEffect(() => {

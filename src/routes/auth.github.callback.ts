@@ -1,4 +1,4 @@
-import { createFileRoute, redirect } from "@tanstack/react-router";
+import { createFileRoute } from "@tanstack/react-router";
 import { createHmac, timingSafeEqual } from "crypto";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
 
@@ -28,12 +28,34 @@ export const Route = createFileRoute("/auth/github/callback")({
         const url = new URL(request.url);
         const code = url.searchParams.get("code");
         const state = url.searchParams.get("state");
+        const installationIdStr = url.searchParams.get("installation_id");
+        const setupAction = url.searchParams.get("setup_action");
         const origin =
           process.env.PUBLIC_APP_URL ?? `${url.protocol}//${url.host}`;
 
+        // --- GitHub App install/setup callback ---
+        // GitHub sends installation_id (+ setup_action) when the user
+        // installs / reconfigures the App. There's no auth header on this
+        // redirect, so we punt the DB write to the dashboard, which runs
+        // under the user's Supabase session.
+        if (installationIdStr) {
+          const installationId = Number(installationIdStr);
+          if (!Number.isFinite(installationId)) {
+            return Response.redirect(`${origin}/dashboard/repos?error=bad_installation`, 302);
+          }
+          if (setupAction === "request") {
+            return Response.redirect(`${origin}/dashboard/repos?error=install_pending`, 302);
+          }
+          return Response.redirect(
+            `${origin}/dashboard/repos?pending_install=${installationId}`,
+            302,
+          );
+        }
+
+        // --- Classic OAuth code-exchange callback ---
         if (!code || !state) {
-          console.error("[github-oauth-callback] missing code/state", { url: request.url, hasCode: !!code, hasState: !!state });
-          return Response.redirect(`${origin}/dashboard/repos?error=missing_code`, 302);
+          console.error("[github-oauth-callback] missing callback params", { url: request.url });
+          return Response.redirect(`${origin}/dashboard/repos?error=missing_callback_params`, 302);
         }
 
         const secret = process.env.SUPABASE_SERVICE_ROLE_KEY!;

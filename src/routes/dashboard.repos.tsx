@@ -80,6 +80,12 @@ function ReposPage() {
   const [isPreviewHost, setIsPreviewHost] = useState(false);
   const [stashedPending, setStashedPending] = useState<number | null>(null);
   const [showReconcile, setShowReconcile] = useState(false);
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<RepoFilter>("all");
+  const [sort, setSort] = useState<RepoSort>("updated");
+  const [view, setView] = useState<RepoView>("grid");
+  const [pendingRepoId, setPendingRepoId] = useState<number | null>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
 
   const connectionQuery = useQuery({
     queryKey: ["github", "connection"],

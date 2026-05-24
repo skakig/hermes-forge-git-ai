@@ -1,28 +1,50 @@
-## Add GitHub OAuth + Hermes API secrets, then wire the connect flow
+## Mission
+Turn the marketing surface into a sellable product: real, distinct pages for **How it works**, **Features**, **Pricing**, plus a fixed **Connect a repository** CTA — all rendered in the existing cyber-desert / ember aesthetic at flagship-launch quality.
 
-### Step 1 — Request secrets
-Prompt you to securely enter:
-- `GITHUB_OAUTH_CLIENT_ID`
-- `GITHUB_OAUTH_CLIENT_SECRET`
-- `HERMES_API_URL`
-- `HERMES_API_KEY`
+## Pages to ship
 
-### Step 2 — GitHub OAuth callback route
-Create `src/routes/api/auth/github/callback.ts` (server route at `/auth/github/callback`) that:
-- Reads `code` + `state` from the request
-- Exchanges `code` for an access token at `https://github.com/login/oauth/access_token`
-- Fetches the GitHub username via `https://api.github.com/user`
-- Upserts `(user_id, access_token, github_username, scope)` into `user_github_credentials` via `supabaseAdmin`
-- Redirects back to `/dashboard/repos?connected=1`
+### 1. `/` — Landing (refined)
+- Nav links rewired from `#how / #features / #pricing` (anchors that don't exist) to real routes `/how-it-works`, `/features`, `/pricing`.
+- "Connect a repository" CTA → routes to `/dashboard/repos` (unauth users land on the sign-in screen first, then bounce to repos where the working OAuth button lives).
+- Tighten the hero, add a "trusted by repos like" strip, an animated "loop" visualization band, and a final CTA section above the footer.
 
-### Step 3 — "Connect GitHub" initiator
-- Add a server fn `startGithubOAuth` (protected by `requireSupabaseAuth`) that returns the GitHub authorize URL with `client_id`, `redirect_uri=https://hermes-forge-git-ai.lovable.app/auth/github/callback`, `scope=repo read:user`, and a signed `state` (containing the user id)
-- Wire the existing "Connect GitHub" button on `/dashboard/repos` (and Topbar if present) to call it and `window.location.assign` the result
+### 2. `/how-it-works` (new route)
+Four-step ritual narrative — **Connect → Audit → Forge → Ship**. Each step gets:
+- A large numbered glyph and ember-accented heading
+- A short prose explanation
+- A mini "what happens" panel (e.g. tree of files being audited, diff being written, PR being opened)
+- A vertical ember timeline connecting all four steps with rune-grid backdrop
+Closes with a CTA card → "Ignite the Forge".
 
-### Step 4 — Hermes API adapter
-Create `src/lib/hermes.server.ts` with a thin fetch wrapper that reads `HERMES_API_URL` + `HERMES_API_KEY` from `process.env` inside handlers (start-loop, get-status). Not wired to UI in this step — just the typed client ready for the loop control to call.
+### 3. `/features` (new route)
+Twelve+ capability cards across three groups:
+- **Autonomy** — background loops, goal alignment, multi-repo, scheduling
+- **Craftsmanship** — clean branches, reasoned commits, critique reports, content QA
+- **Trust & control** — scoped GitHub auth, PR-only writes, audit log, kill switch
+Hero band uses a bento-grid layout (mixed sizes) so it feels editorial, not stock-cards.
 
-### Technical notes
-- Callback URL to register in GitHub: `https://hermes-forge-git-ai.lovable.app/auth/github/callback`
-- Token stays server-side only (`user_github_credentials`, no RLS policies → admin-only access)
-- `state` is HMAC-signed with `SUPABASE_SERVICE_ROLE_KEY` to bind it to the user and prevent CSRF
+### 4. `/pricing` (new route)
+Three tiers in a desert-temple layout (center plan elevated):
+- **Apprentice** — Free · 1 repo · 5 loops/mo · community goals
+- **Forgemaster** — $29/mo · 10 repos · unlimited loops · priority queue · background mode
+- **Sovereign** — $99/mo · unlimited repos · custom goals · SSO · audit export · priority support
+Each card: feature checklist, plan-specific accent ring, "Start" button → `/dashboard/repos`. Below: short FAQ accordion (Stripe note: "Billing not wired yet — buttons route to onboarding").
+
+## Shared chrome
+- Extract the marketing header + footer into `src/components/marketing/MarketingShell.tsx` so all four public pages share identical nav with active states (TanStack `<Link>` + `activeProps`).
+- Nav items: Home / How it works / Features / Pricing + right-side **Sign in** and ember **Ignite the Forge**.
+
+## Visual system (no token drift)
+Reuse existing tokens only: `ember-gradient`, `glass`, `rune-grid`, `text-glow`, `shadow-ember`, `drift`, `font-display`. Each page gets one distinct hero motif so they feel like a series, not a copy:
+- How it works → vertical ember spine
+- Features → bento grid w/ glowing rune corners
+- Pricing → three obelisks rising from sand glow
+
+## SEO
+Per-page `head()` with unique title, description, og:title, og:description (route-architecture rule).
+
+## Technical notes
+- New route files: `src/routes/how-it-works.tsx`, `src/routes/features.tsx`, `src/routes/pricing.tsx`.
+- New component: `src/components/marketing/MarketingShell.tsx` (header + footer + outlet-style children).
+- `src/routes/index.tsx` updated to use MarketingShell and fixed CTAs.
+- No backend changes; no new dependencies.

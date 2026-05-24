@@ -8,7 +8,12 @@ import { Button } from "@/components/ui/button";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { AlertCircle, CheckCircle2, ExternalLink, Github, Plus, RefreshCw, Check } from "lucide-react";
 import { startGithubOAuth } from "@/lib/github-oauth.functions";
-import { getGithubConnection, listInstallationRepos, addRepoToForge } from "@/lib/github-app.functions";
+import {
+  getGithubConnection,
+  listInstallationRepos,
+  addRepoToForge,
+  recordInstallation,
+} from "@/lib/github-app.functions";
 import { listConnectedRepos } from "@/lib/dashboard.functions";
 
 const PUBLISHED_HOST = "hermes-forge-git-ai.lovable.app";
@@ -21,12 +26,18 @@ const ERROR_MESSAGES: Record<string, string> = {
   install_pending: "Your org admin needs to approve the GitHub App install before Hermes can connect.",
   store: "We received the installation but couldn't save it. Check the server logs.",
   missing_app_slug: "The GitHub App slug isn't configured. Add the GITHUB_APP_SLUG secret.",
+  missing_callback_params: "GitHub redirected back with no useful parameters. Try installing again from the dashboard.",
+  record_failed: "We couldn't save your GitHub App installation. Try installing again.",
 };
 
 export const Route = createFileRoute("/dashboard/repos")({
   validateSearch: (search: Record<string, unknown>) => ({
     installed: search.installed === "1" ? ("1" as const) : undefined,
     error: typeof search.error === "string" ? search.error : undefined,
+    pending_install:
+      typeof search.pending_install === "string" || typeof search.pending_install === "number"
+        ? Number(search.pending_install)
+        : undefined,
   }),
   component: ReposPage,
 });
@@ -37,9 +48,10 @@ function ReposPage() {
   const fetchConnection = useServerFn(getGithubConnection);
   const fetchConnected = useServerFn(listConnectedRepos);
   const addRepo = useServerFn(addRepoToForge);
+  const recordInstall = useServerFn(recordInstallation);
   const queryClient = useQueryClient();
   const navigate = useNavigate();
-  const { installed, error } = Route.useSearch();
+  const { installed, error, pending_install } = Route.useSearch();
   const [loading, setLoading] = useState(false);
   const [isPreviewHost, setIsPreviewHost] = useState(false);
 
@@ -87,6 +99,32 @@ function ReposPage() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Finish the App install flow: GitHub redirected to /auth/github/callback,
+  // which bounced us here with ?pending_install=<id>. Record it now under the
+  // authenticated user.
+  useEffect(() => {
+    if (!pending_install || !Number.isFinite(pending_install)) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        await recordInstall({ data: { installation_id: pending_install } });
+        if (cancelled) return;
+        toast.success("GitHub App installed — Hermes can now reach your repositories.");
+        queryClient.invalidateQueries({ queryKey: ["github"] });
+        navigate({ to: "/dashboard/repos", search: {}, replace: true });
+      } catch (e) {
+        console.error(e);
+        if (cancelled) return;
+        toast.error(e instanceof Error ? e.message : "Failed to record installation");
+        navigate({ to: "/dashboard/repos", search: { error: "record_failed" }, replace: true });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending_install]);
 
   const connect = async () => {
     try {

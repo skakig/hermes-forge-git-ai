@@ -2,7 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
-import { fetchInstallationRepos, type InstallationRepoDTO } from "./github-app.server";
+import { fetchInstallationRepos, getInstallationToken, type InstallationRepoDTO } from "./github-app.server";
 
 export const getGithubConnection = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
@@ -109,4 +109,62 @@ export const removeRepoFromForge = createServerFn({ method: "POST" })
       .eq("user_id", context.userId);
     if (error) throw new Error(error.message);
     return { ok: true };
+  });
+
+// Called by /dashboard/repos after GitHub redirects back from the App
+// install/setup flow with ?pending_install=<id>. We identify the user via
+// their Supabase session instead of relying on a signed `state` (GitHub
+// doesn't always forward it on installation redirects).
+export const recordInstallation = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) =>
+    z.object({ installation_id: z.number().int().positive() }).parse(input),
+  )
+  .handler(async ({ context, data }) => {
+    let accountLogin = "unknown";
+    let accountType = "User";
+    try {
+      const token = await getInstallationToken(data.installation_id);
+      const probe = await fetch(
+        "https://api.github.com/installation/repositories?per_page=1",
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/vnd.github+json",
+            "User-Agent": "hermes-forge",
+          },
+        },
+      );
+      if (probe.ok) {
+        const j = (await probe.json()) as {
+          repositories?: Array<{ owner?: { login?: string; type?: string } }>;
+        };
+        const o = j.repositories?.[0]?.owner;
+        if (o?.login) accountLogin = o.login;
+        if (o?.type) accountType = o.type;
+      } else {
+        const text = await probe.text().catch(() => "");
+        console.error("[record-installation] probe failed", probe.status, text);
+      }
+    } catch (e) {
+      console.error("[record-installation] token/probe error", e);
+    }
+
+    const { error } = await supabaseAdmin
+      .from("github_installations")
+      .upsert(
+        {
+          user_id: context.userId,
+          installation_id: data.installation_id,
+          account_login: accountLogin,
+          account_type: accountType,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id,installation_id" },
+      );
+    if (error) {
+      console.error("[record-installation] upsert failed", error);
+      throw new Error(error.message);
+    }
+    return { ok: true as const, account_login: accountLogin };
   });

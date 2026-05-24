@@ -117,7 +117,13 @@ export const pollLoopStatus = createServerFn({ method: "POST" })
         pr_number?: number;
         message?: string;
       };
-      const patch: Record<string, unknown> = {};
+      const patch: {
+        phase?: string;
+        status?: string;
+        pr_url?: string;
+        pr_number?: number;
+        finished_at?: string;
+      } = {};
       if (remote.phase && remote.phase !== loop.phase) patch.phase = remote.phase;
       if (remote.status && remote.status !== loop.status) patch.status = remote.status;
       if (remote.pr_url) patch.pr_url = remote.pr_url;

@@ -538,33 +538,44 @@ function ReposPage() {
           an installation is linked. */}
       <InstallationHealthCard />
 
+      {isConnected && repos.length > 0 ? (
+        <RepoCommandBar
+          ref={searchRef}
+          query={query}
+          onQueryChange={setQuery}
+          filter={filter}
+          onFilterChange={setFilter}
+          sort={sort}
+          onSortChange={setSort}
+          view={view}
+          onViewChange={setView}
+        />
+      ) : null}
+
       {isConnected && reposQuery.isLoading ? (
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {Array.from({ length: 6 }).map((_, i) => (
-            <div key={i} className="rounded-xl border border-border/60 glass p-4 h-24 animate-pulse" />
+            <div key={i} className="rounded-xl border border-border/60 glass p-4 h-40 animate-pulse" />
           ))}
         </div>
       ) : null}
 
-      {isConnected && repos.length > 0 ? (
-        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {repos.map((r) => {
-            const alreadyAdded = connectedIds.has(r.full_name);
-            return (
-              <div key={r.id} className="space-y-2">
+      {isConnected && repos.length > 0 && visibleRepos.length > 0 ? (
+        view === "grid" ? (
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {visibleRepos.map((r) => {
+              const alreadyAdded = connectedIds.has(r.full_name);
+              return (
                 <RepoCard
+                  key={r.id}
                   name={r.full_name}
                   stars={r.stargazers_count}
                   branch={r.default_branch}
                   isPrivate={r.private}
-                  active={alreadyAdded}
-                />
-                <Button
-                  size="sm"
-                  variant={alreadyAdded ? "outline" : "default"}
-                  className="w-full gap-2"
-                  disabled={alreadyAdded || addMutation.isPending}
-                  onClick={() =>
+                  updatedAt={r.updated_at}
+                  added={alreadyAdded}
+                  loading={pendingRepoId === r.id}
+                  onAdd={() =>
                     addMutation.mutate({
                       github_id: r.id,
                       full_name: r.full_name,
@@ -574,12 +585,56 @@ function ReposPage() {
                       default_branch: r.default_branch,
                     })
                   }
-                >
-                  {alreadyAdded ? (<><Check className="size-3" /> In The Forge</>) : (<><Plus className="size-3" /> Add to Hermes</>)}
-                </Button>
-              </div>
-            );
-          })}
+                />
+              );
+            })}
+          </div>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {visibleRepos.map((r) => {
+              const alreadyAdded = connectedIds.has(r.full_name);
+              return (
+                <RepoRow
+                  key={r.id}
+                  name={r.full_name}
+                  stars={r.stargazers_count}
+                  branch={r.default_branch}
+                  isPrivate={r.private}
+                  updatedAt={r.updated_at}
+                  added={alreadyAdded}
+                  loading={pendingRepoId === r.id}
+                  onAdd={() =>
+                    addMutation.mutate({
+                      github_id: r.id,
+                      full_name: r.full_name,
+                      name: r.name,
+                      owner: r.owner,
+                      private: r.private,
+                      default_branch: r.default_branch,
+                    })
+                  }
+                />
+              );
+            })}
+          </div>
+        )
+      ) : null}
+
+      {isConnected && repos.length > 0 && visibleRepos.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-border/60 bg-card/30 p-12 flex flex-col items-center text-center gap-3">
+          <div className="w-12 h-12 rounded-full border border-dashed border-border grid place-items-center text-muted-foreground">
+            <Search className="w-5 h-5" />
+          </div>
+          <div className="text-sm text-foreground">No repositories match your filters.</div>
+          <button
+            onClick={() => {
+              setQuery("");
+              setFilter("all");
+            }}
+            className="text-xs text-primary hover:underline"
+          >
+            Reset filters
+          </button>
         </div>
       ) : null}
 

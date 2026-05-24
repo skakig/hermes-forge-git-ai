@@ -1,87 +1,38 @@
-# Hermes Forge — Make the agent actually work
+## What's actually happening
 
-Two parts: a quick cleanup of the lies in the UI, then the real build — an in-app autonomous agent that reads a repo, plans a fix, opens a draft PR, and iterates.
+The screenshot is the **published** site (`hermes-forge-git-ai.lovable.app`). The in-app agent we built lives only in the preview build — published is still serving the old worker that calls an external Hermes API. That's why ignite fails with:
 
-## Part 1 — UI cleanup (small, fast)
+> `Invalid URL: HERMES_API_URL=https://kqhznlbpkxheyrgyqnvm.supabase.co/loops`
 
-1. **Topbar** — remove the non-functional "Search repos, PRs, runes…" input. Keep the notification bell, connection status pill, and avatar. The Repositories page already has the real ⌘K command bar — that's the search surface.
-2. **Sidebar "Background Mode"** — replace the hardcoded `Agent active · 3 loops running` with live data from `getDashboardStats` (`activeLoops` count). Hide the panel when count is 0 instead of lying. Pulse the dot only when count > 0.
-3. **Ignite Loop dialog** — replace the bare "Choose repo" Select with a proper dialog: repo picker + a **Bug report / instructions** textarea (free-form, optional). That text becomes a per-loop steering message on top of the standing goals.
+Two compounding problems:
 
-## Part 2 — The agent engine (the real work)
+1. **Stale published build.** The new 7-phase in-app agent (Lovable AI + GitHub API) was deployed to preview, not production.
+2. **Malformed secret value.** The `HERMES_API_URL` secret was saved with the literal text `HERMES_API_URL=` glued to the front of the URL (full env-file line pasted as the value). Even on the old build it would have failed `new URL(...)`.
+3. **Stale references remain in code.** `src/lib/github-app.functions.ts` (`checkHermesHealth`) and `src/routes/dashboard.settings.tsx` still mention `HERMES_API_URL` / `HERMES_API_KEY`. The new in-app agent doesn't need either.
 
-Build the agent inside this app as a series of TanStack server functions calling Lovable AI Gateway (Gemini 2.5 Pro by default) and the GitHub REST API via the existing GitHub App installation token. No external Hermes service.
+## Plan
 
-### Engine architecture
+1. **Remove dead external-Hermes code path**
+   - Delete `checkHermesHealth` from `src/lib/github-app.functions.ts` (no longer meaningful — agent runs in-app via Lovable AI).
+   - Update `src/routes/dashboard.settings.tsx` to drop the `HERMES_API_URL` / `HERMES_API_KEY` row and replace it with a "Hermes engine: in-app (Lovable AI · Gemini 2.5 Pro)" status line.
 
-The loop runs as **discrete phases**, each a server function call. The browser polls `pollLoopStatus` every few seconds and triggers the next phase. This sidesteps Cloudflare Workers' per-invocation CPU/time limits — each phase is a short, self-contained AI call.
+2. **Delete the now-unused secrets**
+   - `HERMES_API_URL` and `HERMES_API_KEY` from project secrets (so nothing on the server can accidentally read a malformed value again).
 
-```text
-ignite ─► AUDIT ─► PLAN ─► DRAFT_PR ─► PATCH ─► COMMIT ─► READY ─► (await human)
-                                          ▲                │
-                                          └── iterate ◄────┘ (optional)
-```
+3. **Harden the ignite error surface**
+   - In `pollLoopStatus` (`src/lib/hermes.functions.ts`), the `phase_failed` toast currently just bubbles `e.message`. Add a friendlier wrapper so the UI shows "Audit phase failed: …" instead of a raw stack. Already partially done — verify it doesn't truncate the real cause.
+   - Confirm `runPhase` properly throws on missing `LOVABLE_API_KEY` with a clear hint.
 
-| Phase      | What runs server-side                                                                                                                                                                                          |
-| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `audit`    | GitHub API: list repo tree (capped at ~400 source files, skip lockfiles/dist/node_modules), fetch README + package.json + top-level config. Lovable AI summarizes the codebase: stack, structure, entry points. |
-| `plan`     | Send: audit summary + active goals + per-loop bug report. Gemini 2.5 Pro returns a structured plan: hypothesis, suspect files (paths), proposed change in plain English, risk level.                            |
-| `draft_pr` | Create branch `forge/auto-{ts}` from default branch via GitHub API. Open a **draft PR** with the plan as the body and a checklist of files it will touch. Save `pr_number` + `pr_url` to `loops`.               |
-| `patch`    | For each suspect file: fetch contents, send to AI with the plan, get back a full replacement (or a structured diff via tool calling). Apply via GitHub Contents API (commits to branch).                       |
-| `commit`   | Push a single squashable commit message: `fix: {short summary} · hermes`. Optionally append a follow-up comment on the PR explaining what changed.                                                              |
-| `ready`    | Flip PR from draft → ready for review via GitHub API. Mark loop `status='completed'`. Log activity event.                                                                                                       |
-
-### How the agent finds your dice-strategy bug
-
-You ignite a loop on `skakig/dice-strategy-oracle` and paste into the bug report textarea:
-> "Probability output looks wrong when rolling 3 or more dice — should be much lower than what it shows."
-
-- `audit` finds the relevant source files (probability/odds/dice keywords get higher weight in the file ranker).
-- `plan` produces something like: *"Hypothesis: the multiplier in `calculateOdds` uses addition where it should use multiplication for independent events. Suspect file: `src/lib/odds.ts`. Will write a failing test first, then fix."*
-- `draft_pr` opens PR with that plan as the body — **you can stop here, comment, or let it continue**.
-- `patch` rewrites the file. `commit` pushes. `ready` flips to ready-for-review.
-
-You always get a draft PR with the agent's reasoning *before* it writes code, so nothing surprising lands.
-
-### Frontend changes
-
-- `LoopControl` → `IgniteDialog` modal with repo + bug-report textarea + active-goals preview.
-- `LoopControl` phase list extended to the new 7 phases with live PR link as soon as `draft_pr` completes.
-- New `ActiveLoopCard` on dashboard showing in-flight loops with progress + cancel button (cancel = mark `status='canceled'`, server fn stops on next phase poll).
-- `PRList` already exists — will show the draft PRs automatically.
-
-## Technical details
-
-**Files to touch (Part 1):**
-- `src/components/forge/Topbar.tsx` — remove search input
-- `src/components/forge/Sidebar.tsx` — wire to `getDashboardStats`, hide-when-zero
-- `src/components/forge/LoopControl.tsx` — split into dialog + per-loop bug textarea
-- `src/routes/dashboard.index.tsx` — pass `activeLoops` to sidebar via context or duplicate query
-
-**Files to touch (Part 2):**
-- `src/lib/hermes.server.ts` — **replace** the external-API client with in-app phase runners (`runAudit`, `runPlan`, `runDraftPr`, `runPatch`, `runCommit`, `runReady`). Each uses Lovable AI Gateway + GitHub REST API.
-- `src/lib/github-app.server.ts` — add helpers: `listRepoTree`, `getFileContents`, `createBranch`, `createOrUpdateFile`, `createPullRequest`, `updatePullRequest`, `addPRComment`.
-- `src/lib/hermes.functions.ts` — `startHermesLoop` no longer calls external; just inserts loop row + phase=`audit` and returns. `pollLoopStatus` becomes the **driver**: reads the loop row, runs the next phase if status=`running`, persists result, returns updated state. Add `cancelLoop` server fn. Add per-loop `bug_report` input.
-- `loops` table — add columns: `bug_report text`, `plan jsonb`, `suspect_files text[]`, `pr_is_draft boolean` (migration).
-- AI calls use Lovable AI Gateway (`https://ai.gateway.lovable.dev/v1/chat/completions`) with `LOVABLE_API_KEY` (already in secrets). Default model `google/gemini-2.5-pro`; use tool-calling for structured plan + diff outputs.
-- Deprecate `HERMES_API_URL` / `HERMES_API_KEY` secrets (leave in place, just stop reading them).
-
-**Worker runtime constraints handled:**
-- No `git clone`, no `child_process` — everything via GitHub REST API.
-- Each phase is one server-fn invocation, bounded to a single AI call + a few HTTP calls. Stays well under Cloudflare CPU limits.
-- The browser drives the loop forward via polling, which already happens every 4s in `LoopControl`.
-
-**What I will NOT do in this pass (out of scope):**
-- Multi-file refactors larger than ~5 files per loop (capped to keep PRs reviewable).
-- Running real tests in CI inside the loop (we can add a follow-up phase later that calls a GitHub Actions workflow and waits).
-- Embedding-based file search (we'll start with keyword + path heuristics; add embeddings later if precision is poor).
-- Touching the Topbar search behavior for the dashboard pages other than Repositories.
+4. **Republish**
+   - After the code changes land, publish so `hermes-forge-git-ai.lovable.app` actually serves the in-app agent. Then ignite on `skakig/dice-strategy-oracle` with the dice-bug report and watch the 7 phases advance.
 
 ## Validation
 
-After implementation:
-1. Sidebar reads 0 loops when none active, hides panel.
-2. Topbar has no search input.
-3. Ignite on `dice-strategy-oracle` with the bug-report message → within ~30s a draft PR exists on GitHub with the agent's plan as the body → within ~2 min the PR has a commit with the proposed fix → PR flips to ready-for-review.
-4. Activity feed shows one event per phase transition.
-5. Cancel button on an in-flight loop stops further phases.
+- Settings page shows the new "in-app engine" line, no HERMES_API_URL row.
+- A fresh ignite from the published URL advances past `audit → plan → draft_pr` and creates a draft PR on the repo within ~60s.
+- No more `Invalid URL: HERMES_API_URL=...` events in `activity_events`.
+
+## Out of scope
+
+- Re-introducing any external Hermes service.
+- Changes to the agent's prompting / patch logic (that's the next iteration once we confirm it runs end-to-end).

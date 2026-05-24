@@ -40,12 +40,12 @@ function DashboardHome() {
       <div>
         <h2 className="font-display text-xl mb-3">Repositories</h2>
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          <RepoCard name="skakig/hermes-webui" stars={128} prs={4} branch="forge/refactor" active />
-          <RepoCard name="skakig/cae-content" stars={42} prs={2} branch="main" />
-          <RepoCard name="skakig/desert-queen" stars={319} prs={6} branch="forge/docs" />
-          <RepoCard name="skakig/oracle-api" stars={87} prs={1} branch="main" />
-          <RepoCard name="skakig/runeforge-cli" stars={54} prs={0} branch="main" />
-          <RepoCard name="skakig/sandstorm-core" stars={201} prs={3} branch="forge/types" />
+          <RepoCard name="skakig/hermes-webui" stars={128} branch="forge/refactor" active />
+          <RepoCard name="skakig/cae-content" stars={42} branch="main" />
+          <RepoCard name="skakig/desert-queen" stars={319} branch="forge/docs" />
+          <RepoCard name="skakig/oracle-api" stars={87} branch="main" />
+          <RepoCard name="skakig/runeforge-cli" stars={54} branch="main" />
+          <RepoCard name="skakig/sandstorm-core" stars={201} branch="forge/types" />
         </div>
       </div>
     </div>

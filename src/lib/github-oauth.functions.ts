@@ -1,5 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { supabaseAdmin } from "@/integrations/supabase/client.server";
 import { createHmac } from "crypto";
 
 function signState(userId: string, secret: string) {
@@ -47,4 +48,80 @@ export const startGithubOAuth = createServerFn({ method: "POST" })
     url.searchParams.set("allow_signup", "false");
     console.log("[github-oauth] starting classic OAuth flow");
     return { url: url.toString() };
+  });
+
+export type GithubRepoDTO = {
+  id: number;
+  full_name: string;
+  name: string;
+  owner: string;
+  private: boolean;
+  default_branch: string;
+  stargazers_count: number;
+  open_issues_count: number;
+  updated_at: string | null;
+};
+
+export const listGithubRepos = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { data: cred, error: credErr } = await supabaseAdmin
+      .from("user_github_credentials")
+      .select("access_token")
+      .eq("user_id", context.userId)
+      .maybeSingle();
+
+    if (credErr) {
+      console.error("[list-github-repos] credentials lookup failed", credErr);
+      return { repos: [] as GithubRepoDTO[], notConnected: false, tokenInvalid: false, error: "lookup_failed" as const };
+    }
+    if (!cred?.access_token) {
+      return { repos: [] as GithubRepoDTO[], notConnected: true, tokenInvalid: false, error: null };
+    }
+
+    const res = await fetch(
+      "https://api.github.com/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member",
+      {
+        headers: {
+          Authorization: `Bearer ${cred.access_token}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": "hermes-forge",
+        },
+      },
+    );
+
+    if (res.status === 401) {
+      return { repos: [] as GithubRepoDTO[], notConnected: false, tokenInvalid: true, error: "unauthorized" as const };
+    }
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.error("[list-github-repos] github error", { status: res.status, body });
+      return { repos: [] as GithubRepoDTO[], notConnected: false, tokenInvalid: false, error: `github_${res.status}` };
+    }
+
+    const json = (await res.json()) as Array<{
+      id: number;
+      name: string;
+      full_name: string;
+      owner: { login: string };
+      private: boolean;
+      default_branch: string;
+      stargazers_count: number;
+      open_issues_count: number;
+      updated_at: string | null;
+    }>;
+
+    const repos: GithubRepoDTO[] = json.map((r) => ({
+      id: r.id,
+      name: r.name,
+      full_name: r.full_name,
+      owner: r.owner.login,
+      private: r.private,
+      default_branch: r.default_branch,
+      stargazers_count: r.stargazers_count,
+      open_issues_count: r.open_issues_count,
+      updated_at: r.updated_at,
+    }));
+
+    return { repos, notConnected: false, tokenInvalid: false, error: null };
   });

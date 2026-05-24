@@ -50,7 +50,17 @@ function LoginPage() {
   useEffect(() => {
     const { data } = supabase.auth.onAuthStateChange((event, session) => {
       if (event === "SIGNED_IN" && session) {
-        navigate({ to: target } as never);
+        let dest = target;
+        try {
+          const stashed = sessionStorage.getItem("hermes:postLoginRedirect");
+          if (stashed) {
+            dest = stashed;
+            sessionStorage.removeItem("hermes:postLoginRedirect");
+          }
+        } catch {
+          /* ignore */
+        }
+        navigate({ to: dest } as never);
       }
     });
     return () => data.subscription.unsubscribe();
@@ -70,10 +80,22 @@ function LoginPage() {
         const { data, error } = await supabase.auth.signUp({
           email,
           password,
-          options: { emailRedirectTo: `${window.location.origin}/login?redirect=${encodeURIComponent(target)}` },
+          options: { emailRedirectTo: `${window.location.origin}/login` },
         });
         if (error) throw error;
-        if (data.session) {
+        // Supabase returns 200 with an empty identities array when the email
+        // is already registered (anti-enumeration). Detect and surface it.
+        const alreadyExists =
+          !data.session &&
+          data.user &&
+          Array.isArray(data.user.identities) &&
+          data.user.identities.length === 0;
+        if (alreadyExists) {
+          setTab("signin");
+          const msg = "An account with this email already exists. Try signing in — or use Google if you signed up that way.";
+          setErr(msg);
+          toast.error(msg);
+        } else if (data.session) {
           toast.success("Account forged. Igniting…");
           navigate({ to: target } as never);
         } else {
@@ -93,8 +115,15 @@ function LoginPage() {
     setErr(null);
     setOauthLoading(true);
     try {
+      // Stash the post-auth destination — the OAuth broker requires a clean
+      // redirect_uri without query strings.
+      try {
+        sessionStorage.setItem("hermes:postLoginRedirect", target);
+      } catch {
+        /* ignore */
+      }
       const result = await lovable.auth.signInWithOAuth("google", {
-        redirect_uri: `${window.location.origin}/login?redirect=${encodeURIComponent(target)}`,
+        redirect_uri: `${window.location.origin}/login`,
       });
       if (result.error) throw result.error;
       if (!("redirected" in result) || !result.redirected) {

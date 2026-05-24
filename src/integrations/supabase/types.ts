@@ -14,7 +14,215 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      activity_events: {
+        Row: {
+          created_at: string
+          id: string
+          kind: string
+          loop_id: string | null
+          message: string
+          metadata: Json
+          repository_id: string | null
+          user_id: string
+        }
+        Insert: {
+          created_at?: string
+          id?: string
+          kind: string
+          loop_id?: string | null
+          message: string
+          metadata?: Json
+          repository_id?: string | null
+          user_id: string
+        }
+        Update: {
+          created_at?: string
+          id?: string
+          kind?: string
+          loop_id?: string | null
+          message?: string
+          metadata?: Json
+          repository_id?: string | null
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "activity_events_loop_id_fkey"
+            columns: ["loop_id"]
+            isOneToOne: false
+            referencedRelation: "loops"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "activity_events_repository_id_fkey"
+            columns: ["repository_id"]
+            isOneToOne: false
+            referencedRelation: "repositories"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      goals: {
+        Row: {
+          active: boolean
+          created_at: string
+          id: string
+          label: string
+          user_id: string
+        }
+        Insert: {
+          active?: boolean
+          created_at?: string
+          id?: string
+          label: string
+          user_id: string
+        }
+        Update: {
+          active?: boolean
+          created_at?: string
+          id?: string
+          label?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
+      loops: {
+        Row: {
+          branch: string | null
+          created_at: string
+          finished_at: string | null
+          goals: string[]
+          hermes_run_id: string | null
+          id: string
+          phase: string
+          pr_number: number | null
+          pr_url: string | null
+          repository_id: string
+          started_at: string
+          status: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          branch?: string | null
+          created_at?: string
+          finished_at?: string | null
+          goals?: string[]
+          hermes_run_id?: string | null
+          id?: string
+          phase?: string
+          pr_number?: number | null
+          pr_url?: string | null
+          repository_id: string
+          started_at?: string
+          status?: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          branch?: string | null
+          created_at?: string
+          finished_at?: string | null
+          goals?: string[]
+          hermes_run_id?: string | null
+          id?: string
+          phase?: string
+          pr_number?: number | null
+          pr_url?: string | null
+          repository_id?: string
+          started_at?: string
+          status?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "loops_repository_id_fkey"
+            columns: ["repository_id"]
+            isOneToOne: false
+            referencedRelation: "repositories"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      profiles: {
+        Row: {
+          avatar_url: string | null
+          created_at: string
+          display_name: string | null
+          github_access_token: string | null
+          github_username: string | null
+          id: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          avatar_url?: string | null
+          created_at?: string
+          display_name?: string | null
+          github_access_token?: string | null
+          github_username?: string | null
+          id?: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          avatar_url?: string | null
+          created_at?: string
+          display_name?: string | null
+          github_access_token?: string | null
+          github_username?: string | null
+          id?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
+      repositories: {
+        Row: {
+          created_at: string
+          default_branch: string
+          full_name: string
+          github_id: number | null
+          id: string
+          last_loop_at: string | null
+          name: string
+          owner: string
+          private: boolean
+          status: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          created_at?: string
+          default_branch?: string
+          full_name: string
+          github_id?: number | null
+          id?: string
+          last_loop_at?: string | null
+          name: string
+          owner: string
+          private?: boolean
+          status?: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          created_at?: string
+          default_branch?: string
+          full_name?: string
+          github_id?: number | null
+          id?: string
+          last_loop_at?: string | null
+          name?: string
+          owner?: string
+          private?: boolean
+          status?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never

@@ -1,12 +1,30 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { RepoCard } from "@/components/forge/RepoCard";
+import { RepoCard, RepoRow } from "@/components/forge/RepoCard";
+import {
+  RepoCommandBar,
+  type RepoFilter,
+  type RepoSort,
+  type RepoView,
+} from "@/components/forge/RepoCommandBar";
 import { Button } from "@/components/ui/button";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { AlertCircle, CheckCircle2, ExternalLink, Github, Plus, RefreshCw, Check, Link2 } from "lucide-react";
+import {
+  AlertCircle,
+  CheckCircle2,
+  ExternalLink,
+  Github,
+  Plus,
+  RefreshCw,
+  Link2,
+  LayoutGrid,
+  List,
+  Search,
+} from "lucide-react";
+import { cn } from "@/lib/utils";
 import { startGithubOAuth } from "@/lib/github-oauth.functions";
 import {
   getGithubConnection,
@@ -62,6 +80,12 @@ function ReposPage() {
   const [isPreviewHost, setIsPreviewHost] = useState(false);
   const [stashedPending, setStashedPending] = useState<number | null>(null);
   const [showReconcile, setShowReconcile] = useState(false);
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<RepoFilter>("all");
+  const [sort, setSort] = useState<RepoSort>("updated");
+  const [view, setView] = useState<RepoView>("grid");
+  const [pendingRepoId, setPendingRepoId] = useState<number | null>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
 
   const connectionQuery = useQuery({
     queryKey: ["github", "connection"],
@@ -83,6 +107,8 @@ function ReposPage() {
   const addMutation = useMutation({
     mutationFn: (vars: { github_id: number; full_name: string; name: string; owner: string; private: boolean; default_branch: string }) =>
       addRepo({ data: vars }),
+    onMutate: (vars) => setPendingRepoId(vars.github_id),
+    onSettled: () => setPendingRepoId(null),
     onSuccess: (res) => {
       if (res.added) toast.success("Repo added to The Forge");
       else toast.info("Already in The Forge");
@@ -95,6 +121,22 @@ function ReposPage() {
     if (typeof window !== "undefined") {
       setIsPreviewHost(!window.location.hostname.endsWith(PUBLISHED_HOST));
     }
+  }, []);
+
+  // Global ⌘K / Ctrl+K → focus the repo search input. Esc clears it.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        searchRef.current?.focus();
+        searchRef.current?.select();
+      } else if (e.key === "Escape" && document.activeElement === searchRef.current) {
+        setQuery("");
+        searchRef.current?.blur();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
 
   useEffect(() => {
@@ -183,6 +225,32 @@ function ReposPage() {
   const showInstallCard = !connectionQuery.isLoading && !installation;
   const repos = reposQuery.data?.repos ?? [];
   const connectedIds = new Set((connectedQuery.data?.repos ?? []).map((r) => r.full_name));
+
+  const visibleRepos = useMemo(() => {
+    let list = repos.slice();
+    if (filter === "inForge") list = list.filter((r) => connectedIds.has(r.full_name));
+    else if (filter === "notAdded") list = list.filter((r) => !connectedIds.has(r.full_name));
+    else if (filter === "private") list = list.filter((r) => r.private);
+    else if (filter === "public") list = list.filter((r) => !r.private);
+    const q = query.trim().toLowerCase();
+    if (q) {
+      list = list.filter(
+        (r) => r.full_name.toLowerCase().includes(q) || r.owner.toLowerCase().includes(q),
+      );
+    }
+    if (sort === "stars") list.sort((a, b) => b.stargazers_count - a.stargazers_count);
+    else if (sort === "name") list.sort((a, b) => a.full_name.localeCompare(b.full_name));
+    else
+      list.sort((a, b) => {
+        const at = a.updated_at ? new Date(a.updated_at).getTime() : 0;
+        const bt = b.updated_at ? new Date(b.updated_at).getTime() : 0;
+        return bt - at;
+      });
+    return list;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repos, connectedQuery.data, filter, query, sort]);
+
+  const hasActiveFilter = filter !== "all" || query.trim().length > 0;
 
   const reconcileQuery = useQuery({
     queryKey: ["github", "reconcile"],
@@ -295,39 +363,87 @@ function ReposPage() {
           </AlertDescription>
         </Alert>
       ) : null}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="font-display text-3xl">Repositories</h1>
-          <p className="text-sm text-muted-foreground mt-1">
-            {isConnected
-              ? `${repos.length} repositories accessible · ${connectedIds.size} added to The Forge`
-              : "Install the Hermes Forge GitHub App to start forging."}
-          </p>
+      <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
+        <div className="space-y-1.5">
+          <h1 className="font-display text-3xl md:text-4xl uppercase tracking-[0.18em] text-foreground">
+            Repositories
+          </h1>
+          {isConnected ? (
+            <div className="flex items-center gap-3 text-sm text-muted-foreground">
+              <span className="flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-primary" />
+                {repos.length} total
+              </span>
+              <span className="w-1 h-1 rounded-full bg-border" />
+              <span>{connectedIds.size} in the forge</span>
+              {hasActiveFilter ? (
+                <>
+                  <span className="w-1 h-1 rounded-full bg-border" />
+                  <span className="text-foreground">
+                    {visibleRepos.length} match{visibleRepos.length === 1 ? "" : "es"}
+                  </span>
+                </>
+              ) : null}
+            </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              Install the Hermes Forge GitHub App to start forging.
+            </p>
+          )}
         </div>
-        {isConnected ? (
-          <Button
-            variant="outline"
-            onClick={() => reposQuery.refetch()}
-            disabled={reposQuery.isFetching}
-            className="gap-2"
-          >
-            <RefreshCw className={`size-4 ${reposQuery.isFetching ? "animate-spin" : ""}`} />
-            Refresh
-          </Button>
-        ) : (
-          <div className="flex gap-2">
-            <Button
-              variant="outline"
-              onClick={() => setShowReconcile((v) => !v)}
-              className="gap-2"
-            >
-              <Link2 className="size-4" /> Re-sync from GitHub
-            </Button>
-            <Button onClick={connect} disabled={loading} className="ember-gradient text-primary-foreground border-0 gap-2">
-              <Plus className="size-4" /> {loading ? "Redirecting…" : "Install GitHub App"}
-            </Button>
-          </div>
-        )}
+        <div className="flex items-center gap-2">
+          {isConnected ? (
+            <>
+              <div className="hidden md:flex bg-white/5 p-1 rounded-lg border border-border/60">
+                <button
+                  onClick={() => setView("grid")}
+                  className={cn(
+                    "px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 transition-colors",
+                    view === "grid"
+                      ? "bg-white/10 text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  <LayoutGrid className="w-3.5 h-3.5" /> Grid
+                </button>
+                <button
+                  onClick={() => setView("dense")}
+                  className={cn(
+                    "px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 transition-colors",
+                    view === "dense"
+                      ? "bg-white/10 text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  <List className="w-3.5 h-3.5" /> Dense
+                </button>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => reposQuery.refetch()}
+                disabled={reposQuery.isFetching}
+                className="gap-2"
+              >
+                <RefreshCw className={cn("size-3.5", reposQuery.isFetching && "animate-spin")} />
+                Refresh
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button
+                variant="outline"
+                onClick={() => setShowReconcile((v) => !v)}
+                className="gap-2"
+              >
+                <Link2 className="size-4" /> Re-sync from GitHub
+              </Button>
+              <Button onClick={connect} disabled={loading} className="ember-gradient text-primary-foreground border-0 gap-2">
+                <Plus className="size-4" /> {loading ? "Redirecting…" : "Install GitHub App"}
+              </Button>
+            </>
+          )}
+        </div>
       </div>
 
       {/* Reconcile panel: lists every installation the App can see and lets the
@@ -422,33 +538,44 @@ function ReposPage() {
           an installation is linked. */}
       <InstallationHealthCard />
 
+      {isConnected && repos.length > 0 ? (
+        <RepoCommandBar
+          ref={searchRef}
+          query={query}
+          onQueryChange={setQuery}
+          filter={filter}
+          onFilterChange={setFilter}
+          sort={sort}
+          onSortChange={setSort}
+          view={view}
+          onViewChange={setView}
+        />
+      ) : null}
+
       {isConnected && reposQuery.isLoading ? (
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {Array.from({ length: 6 }).map((_, i) => (
-            <div key={i} className="rounded-xl border border-border/60 glass p-4 h-24 animate-pulse" />
+            <div key={i} className="rounded-xl border border-border/60 glass p-4 h-40 animate-pulse" />
           ))}
         </div>
       ) : null}
 
-      {isConnected && repos.length > 0 ? (
-        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {repos.map((r) => {
-            const alreadyAdded = connectedIds.has(r.full_name);
-            return (
-              <div key={r.id} className="space-y-2">
+      {isConnected && repos.length > 0 && visibleRepos.length > 0 ? (
+        view === "grid" ? (
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {visibleRepos.map((r) => {
+              const alreadyAdded = connectedIds.has(r.full_name);
+              return (
                 <RepoCard
+                  key={r.id}
                   name={r.full_name}
                   stars={r.stargazers_count}
                   branch={r.default_branch}
                   isPrivate={r.private}
-                  active={alreadyAdded}
-                />
-                <Button
-                  size="sm"
-                  variant={alreadyAdded ? "outline" : "default"}
-                  className="w-full gap-2"
-                  disabled={alreadyAdded || addMutation.isPending}
-                  onClick={() =>
+                  updatedAt={r.updated_at}
+                  added={alreadyAdded}
+                  loading={pendingRepoId === r.id}
+                  onAdd={() =>
                     addMutation.mutate({
                       github_id: r.id,
                       full_name: r.full_name,
@@ -458,12 +585,56 @@ function ReposPage() {
                       default_branch: r.default_branch,
                     })
                   }
-                >
-                  {alreadyAdded ? (<><Check className="size-3" /> In The Forge</>) : (<><Plus className="size-3" /> Add to Hermes</>)}
-                </Button>
-              </div>
-            );
-          })}
+                />
+              );
+            })}
+          </div>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {visibleRepos.map((r) => {
+              const alreadyAdded = connectedIds.has(r.full_name);
+              return (
+                <RepoRow
+                  key={r.id}
+                  name={r.full_name}
+                  stars={r.stargazers_count}
+                  branch={r.default_branch}
+                  isPrivate={r.private}
+                  updatedAt={r.updated_at}
+                  added={alreadyAdded}
+                  loading={pendingRepoId === r.id}
+                  onAdd={() =>
+                    addMutation.mutate({
+                      github_id: r.id,
+                      full_name: r.full_name,
+                      name: r.name,
+                      owner: r.owner,
+                      private: r.private,
+                      default_branch: r.default_branch,
+                    })
+                  }
+                />
+              );
+            })}
+          </div>
+        )
+      ) : null}
+
+      {isConnected && repos.length > 0 && visibleRepos.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-border/60 bg-card/30 p-12 flex flex-col items-center text-center gap-3">
+          <div className="w-12 h-12 rounded-full border border-dashed border-border grid place-items-center text-muted-foreground">
+            <Search className="w-5 h-5" />
+          </div>
+          <div className="text-sm text-foreground">No repositories match your filters.</div>
+          <button
+            onClick={() => {
+              setQuery("");
+              setFilter("all");
+            }}
+            className="text-xs text-primary hover:underline"
+          >
+            Reset filters
+          </button>
         </div>
       ) : null}
 

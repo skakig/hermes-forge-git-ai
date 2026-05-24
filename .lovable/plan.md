@@ -1,116 +1,66 @@
-## Audit findings
+## Goal
 
-The GitHub App is installed in GitHub, but Hermes has **zero linked installation rows** in the database. That means GitHub knows the App is installed, while Hermes does not yet know which installation belongs to your logged-in account.
+Make `/dashboard/repos` searchable, filterable, and visually best-in-class — built from the "Raycast commander" prototype the user picked. Frontend-only; no backend or server-fn changes.
 
-The current install button starts the GitHub App install flow correctly, but when the App is already installed GitHub sends you to the GitHub App/settings surface instead of giving Hermes a reliable `installation_id` handoff. The existing fallback, **Re-sync from GitHub**, is the right idea but server logs show it currently fails with `Invalid character`, which points to private-key/JWT parsing or key formatting during App-level API calls.
+## Scope
 
-Also confirmed:
-- `github_installations`: 0 rows
-- `repositories`: 0 rows
-- `loops`: 0 rows
-- `activity_events`: 0 rows
-- Topbar “Connected” is still static UI, not real status
-- Activity realtime is coded client-side, but the database table is not enabled for realtime publication
-- Settings is still mock UI
+Files touched:
+- `src/routes/dashboard.repos.tsx` — wire state, filtering, sorting, render new layout
+- `src/components/forge/RepoCard.tsx` — rewrite to match the prototype card (icon tile, "Forge" badge, updated metadata row, full-width gradient CTA)
+- `src/components/forge/RepoCommandBar.tsx` *(new)* — sticky glass command bar (search input + ⌘K hint, filter chips, sort dropdown)
 
-## Phase 2 implementation plan
+No edits to backend, server functions, Topbar, Sidebar, or InstallationHealthCard.
 
-### 1. Make installed-but-unlinked GitHub Apps recoverable
+## Command bar
 
-Replace the confusing “Install” dead-end with a recovery-first flow:
+Sticky container (`sticky top-4 z-30`), `bg-card/80 backdrop-blur-xl border border-border/60 rounded-2xl`. Two stacked rows:
 
-- Keep the GitHub install button, but rename/copy it so users understand it may open GitHub if already installed.
-- Add a primary **Find installed GitHub App** action that calls the App installations API and lists installations Hermes can see.
-- If the App is already installed for your GitHub user/org, show **Link this installation**.
-- If App-level listing fails, show a precise diagnostic instead of a blank or generic error.
+1. **Search row** — search icon, input bound to `query` state with live fuzzy match on `full_name` and `owner`. `⌘K` kbd hint on the right; global keyboard listener focuses the input on ⌘K / Ctrl+K and clears on Esc.
+2. **Filter row** — pill chips: `All`, `In Forge`, `Not added`, `Private`, `Public`. Active chip uses `bg-primary text-primary-foreground`; inactive use `text-muted-foreground hover:bg-white/5`. Right side: shadcn `DropdownMenu` for sort — options: `Recently updated`, `Stars`, `Name (A→Z)`, `Recently pushed` (uses `pushed_at` if present, falls back to `updated_at`, else name).
 
-### 2. Fix GitHub App private-key handling
+## Header
 
-Harden the server-side GitHub App JWT signer so it accepts common private-key secret formats:
+Replace the current header block with the prototype version: serif uppercase "REPOSITORIES" + tracking, subtitle with orange dot + counts (`N total`, `M in forge`, filtered count when filters active), and Grid/Dense view toggle on the right. Existing top buttons (Re-sync from GitHub, Install GitHub App, Refresh) move into a small overflow row above the command bar so the new design stays clean.
 
-- Raw PEM with actual newlines
-- PEM pasted with escaped `\n`
-- PEM wrapped in quotes
-- Base64-ish whitespace variants
+## Card redesign
 
-Then surface exact failures:
-- Missing `GITHUB_APP_ID`
-- Missing `GITHUB_APP_PRIVATE_KEY`
-- Invalid private key format
-- GitHub App ID/private key mismatch
-- GitHub API permission/revoked installation failure
+Rewrite `RepoCard` to match the prototype:
+- Top: icon tile (rounded square, `bg-white/5 border border-border/60`, package/cube lucide icon — turns orange-tinted on hover or when added)
+- Top-right: stars (mono, small) and, if added, an uppercase `FORGE` badge (`bg-primary/10 text-primary border-primary/20`)
+- Title: `font-mono text-sm text-foreground truncate` (full_name)
+- Meta row: private/lock chip when private, branch with git-branch icon, "updated …" relative time from `updated_at` when available
+- Action button: full-width inside the card. Not-added → ember gradient (`bg-gradient-to-r from-primary to-amber-500 text-primary-foreground active:scale-[0.98]`). Added → `bg-white/5 text-muted-foreground` with check icon and `In The Forge` label, `cursor-default disabled`.
 
-This should address the `Invalid character` error from the App installation listing path.
+Card container gains `hover:border-primary/30 transition-all`.
 
-### 3. Add a real live connection status indicator
+## Dense view
 
-Replace the hardcoded Topbar “Connected” pill with a live status component:
+When view = `dense`, render a single-column list of rows (icon tile + name + meta inline + smaller action button on the right) instead of the grid. Same data, tighter spacing.
 
-- Green: installation linked, token mint works, repos readable
-- Yellow: installation linked but token/repo read has an error
-- Red: no linked installation or app cannot authenticate
-- Gray: checking/unknown
+## Filtering & sorting logic
 
-The status will reuse/extend `checkInstallationHealth`, auto-refresh periodically, and link to `/dashboard/repos` for remediation.
+In `ReposPage`, derive `visibleRepos` with `useMemo`:
+1. Start from `repos` (already loaded from `listInstallationRepos`).
+2. Apply filter chip:
+   - `inForge` → `connectedIds.has(r.full_name)`
+   - `notAdded` → `!connectedIds.has(r.full_name)`
+   - `private` / `public` → by `r.private`
+3. Apply query: case-insensitive substring on `full_name` and `owner`.
+4. Sort by selected key. Default = `Recently updated` (by `updated_at` desc; falls back to name if missing).
 
-### 4. Improve repository page diagnostics
+Show filtered count in subtitle ("12 of 66"). When `visibleRepos.length === 0`, render an empty state (dashed circle + search icon, message, "Reset filters" link).
 
-On `/dashboard/repos`:
+## Tokens / no raw colors
 
-- Show the health card even when not connected, so it explains why there are no repos.
-- Show `listInstallationRepos` errors explicitly, not just an empty repo state.
-- Make “Re-sync from GitHub” more prominent when the database has no installation but GitHub likely does.
-- After a successful claim, immediately refresh installation health, repos, and connected repo counts.
+All new styles use existing semantic tokens (`bg-card`, `border-border`, `text-foreground`, `text-muted-foreground`, `text-primary`, `bg-primary`). The gradient reuses the existing `ember-gradient` utility from `styles.css` where possible; if a new gradient is needed for the CTA, add a `--gradient-ember-cta` token in `src/styles.css` and reference it. No hex literals in component files.
 
-### 5. Enable real-time activity properly
+## Out of scope
 
-Add the database publication needed for realtime updates:
+- No changes to `RepoCommandBar`'s logic touching backend data (purely client-side filter over the already-loaded repo list).
+- No changes to add/claim/reconcile flows.
+- Language detection — the prototype shows a "Language" chip but the API response doesn't currently include language, so I'll either omit that chip or wire it to a placeholder grouping. Confirm preference, otherwise it ships as omitted in v1.
 
-- Enable realtime for `activity_events`
-- Keep RLS user-scoped, so users only receive their own events
+## Validation
 
-The existing `ActivityLog` subscription will then work as intended.
-
-### 6. Replace mock Settings with working controls/diagnostics
-
-Make `/dashboard/settings` a real operational page:
-
-- GitHub App status card with the same live health checks
-- Hermes API status card that tests whether `HERMES_API_URL` and `HERMES_API_KEY` are configured and reachable
-- Background mode status that honestly says whether scheduling is implemented yet
-- Direct links/actions back to Repositories and Activity for troubleshooting
-
-No fake “Billing manage” or “Enabled” badges unless backed by real data.
-
-### 7. Validation
-
-After implementation:
-
-- Check database rows again after linking
-- Check server logs for GitHub signer/listing errors
-- Verify the Topbar status changes based on health result
-- Verify the repo page can list GitHub installations and link one
-- Verify activity realtime table is published
-
-## Technical changes
-
-Expected files/code areas:
-
-- `src/lib/github-app.server.ts` — normalize PEM/private key parsing and clearer GitHub App API errors
-- `src/lib/github-app.functions.ts` — add/extend diagnostics, installation discovery, health status, settings checks
-- `src/components/forge/InstallationHealth.tsx` — support disconnected diagnostics and richer status messages
-- `src/components/forge/Topbar.tsx` — replace static “Connected” with live status
-- `src/routes/dashboard.repos.tsx` — make re-sync/recovery the main path for already-installed apps
-- `src/routes/dashboard.settings.tsx` — replace mock settings with real health/config cards
-- Database migration — enable realtime publication for `activity_events`
-
-## What you should do after this ships
-
-Open the published dashboard, not the preview iframe, then:
-
-1. Go to **Repositories**
-2. Click **Find installed GitHub App / Re-sync from GitHub**
-3. Link the `skakig` installation shown by GitHub
-4. Confirm the Topbar dot turns green and repositories appear
-
-The GitHub App setup URL you showed is correct: `https://hermes-forge-git-ai.lovable.app/auth/github/callback`. The missing piece is Hermes linking the already-installed GitHub installation to your app account and proving it can mint/read with the App credentials.
+- Type-check via build pipeline.
+- Visually confirm sticky command bar, ⌘K focus, filter switching, empty state, dense toggle in preview.

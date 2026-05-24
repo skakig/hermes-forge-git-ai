@@ -268,3 +268,178 @@ export async function fetchInstallationRepos(
   }
   return repos;
 }
+
+// -------------------------------------------------------------------------
+// GitHub REST helpers for the Hermes agent (branches, files, PRs).
+// All calls authenticate with a fresh installation token.
+// -------------------------------------------------------------------------
+
+const GH_HEADERS = {
+  Accept: "application/vnd.github+json",
+  "User-Agent": "hermes-forge",
+  "X-GitHub-Api-Version": "2022-11-28",
+};
+
+async function gh<T>(
+  token: string,
+  path: string,
+  init: RequestInit = {},
+): Promise<T> {
+  const res = await fetch(`https://api.github.com${path}`, {
+    ...init,
+    headers: {
+      ...GH_HEADERS,
+      Authorization: `Bearer ${token}`,
+      ...(init.body ? { "Content-Type": "application/json" } : {}),
+      ...(init.headers ?? {}),
+    },
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`gh_${res.status}: ${init.method ?? "GET"} ${path} :: ${body.slice(0, 400)}`);
+  }
+  if (res.status === 204) return undefined as T;
+  return (await res.json()) as T;
+}
+
+export type RepoTreeEntry = { path: string; type: "blob" | "tree"; size?: number; sha: string };
+
+export async function getBranchHeadSha(
+  token: string,
+  owner: string,
+  repo: string,
+  branch: string,
+): Promise<string> {
+  const res = await gh<{ commit: { sha: string } }>(
+    token,
+    `/repos/${owner}/${repo}/branches/${encodeURIComponent(branch)}`,
+  );
+  return res.commit.sha;
+}
+
+export async function listRepoTree(
+  token: string,
+  owner: string,
+  repo: string,
+  branch: string,
+): Promise<{ sha: string; tree: RepoTreeEntry[]; truncated: boolean }> {
+  const headSha = await getBranchHeadSha(token, owner, repo, branch);
+  const res = await gh<{ sha: string; tree: RepoTreeEntry[]; truncated: boolean }>(
+    token,
+    `/repos/${owner}/${repo}/git/trees/${headSha}?recursive=1`,
+  );
+  return res;
+}
+
+export async function getFileContents(
+  token: string,
+  owner: string,
+  repo: string,
+  path: string,
+  ref: string,
+): Promise<{ content: string; sha: string } | null> {
+  try {
+    const res = await gh<{ content: string; encoding: string; sha: string; type: string }>(
+      token,
+      `/repos/${owner}/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(ref)}`,
+    );
+    if (res.type !== "file") return null;
+    const decoded = atob(res.content.replace(/\n/g, ""));
+    // utf8 decode
+    const bytes = new Uint8Array(decoded.length);
+    for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i);
+    return { content: new TextDecoder().decode(bytes), sha: res.sha };
+  } catch (e) {
+    if (e instanceof Error && /gh_404/.test(e.message)) return null;
+    throw e;
+  }
+}
+
+export async function createBranch(
+  token: string,
+  owner: string,
+  repo: string,
+  newBranch: string,
+  fromSha: string,
+): Promise<void> {
+  await gh(token, `/repos/${owner}/${repo}/git/refs`, {
+    method: "POST",
+    body: JSON.stringify({ ref: `refs/heads/${newBranch}`, sha: fromSha }),
+  });
+}
+
+function utf8ToBase64(str: string): string {
+  const bytes = new TextEncoder().encode(str);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+export async function putFile(
+  token: string,
+  owner: string,
+  repo: string,
+  args: { path: string; content: string; branch: string; message: string; sha?: string },
+): Promise<{ commit: { sha: string; html_url: string } }> {
+  return gh(token, `/repos/${owner}/${repo}/contents/${args.path.split("/").map(encodeURIComponent).join("/")}`, {
+    method: "PUT",
+    body: JSON.stringify({
+      message: args.message,
+      content: utf8ToBase64(args.content),
+      branch: args.branch,
+      ...(args.sha ? { sha: args.sha } : {}),
+    }),
+  });
+}
+
+export async function createPullRequest(
+  token: string,
+  owner: string,
+  repo: string,
+  args: { title: string; head: string; base: string; body: string; draft?: boolean },
+): Promise<{ number: number; html_url: string; node_id: string; draft: boolean }> {
+  return gh(token, `/repos/${owner}/${repo}/pulls`, {
+    method: "POST",
+    body: JSON.stringify({
+      title: args.title,
+      head: args.head,
+      base: args.base,
+      body: args.body,
+      draft: args.draft ?? false,
+    }),
+  });
+}
+
+export async function addPRComment(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+  body: string,
+): Promise<void> {
+  await gh(token, `/repos/${owner}/${repo}/issues/${prNumber}/comments`, {
+    method: "POST",
+    body: JSON.stringify({ body }),
+  });
+}
+
+export async function markPRReadyForReview(token: string, prNodeId: string): Promise<void> {
+  const res = await fetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers: {
+      ...GH_HEADERS,
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      query: `mutation($id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: $id }) { pullRequest { isDraft } } }`,
+      variables: { id: prNodeId },
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`gh_graphql_${res.status}: ${text.slice(0, 300)}`);
+  }
+  const json = (await res.json()) as { errors?: Array<{ message: string }> };
+  if (json.errors?.length) throw new Error(`gh_graphql: ${json.errors.map((e) => e.message).join("; ")}`);
+}

@@ -409,7 +409,7 @@ function ReposPage() {
           <div className="flex-1">
             <div className="font-display text-lg">Install the Hermes Forge GitHub App</div>
             <div className="text-sm text-muted-foreground">
-              On the next screen, pick which repositories Hermes can read, refactor, and open PRs against. You can change this anytime in GitHub settings.
+              On the next screen, pick which repositories Hermes can read, refactor, and open PRs against. Already installed? Click <span className="text-foreground">Re-sync from GitHub</span> above to link it.
             </div>
           </div>
           <Button variant="outline" onClick={connect} disabled={loading}>

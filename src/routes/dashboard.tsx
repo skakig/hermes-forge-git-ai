@@ -1,9 +1,16 @@
-import { createFileRoute, Outlet } from "@tanstack/react-router";
+import { createFileRoute, Outlet, redirect } from "@tanstack/react-router";
+import { supabase } from "@/integrations/supabase/client";
 import { Sidebar } from "@/components/forge/Sidebar";
 import { Topbar } from "@/components/forge/Topbar";
 import { Toaster } from "@/components/ui/sonner";
 
 export const Route = createFileRoute("/dashboard")({
+  beforeLoad: async ({ location }) => {
+    const { data } = await supabase.auth.getSession();
+    if (!data.session) {
+      throw redirect({ to: "/", search: { redirect: location.href } as never });
+    }
+  },
   component: DashboardLayout,
   head: () => ({ meta: [{ title: "Forge · Hermes" }] }),
 });

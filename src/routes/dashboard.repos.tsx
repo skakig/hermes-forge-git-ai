@@ -226,6 +226,32 @@ function ReposPage() {
   const repos = reposQuery.data?.repos ?? [];
   const connectedIds = new Set((connectedQuery.data?.repos ?? []).map((r) => r.full_name));
 
+  const visibleRepos = useMemo(() => {
+    let list = repos.slice();
+    if (filter === "inForge") list = list.filter((r) => connectedIds.has(r.full_name));
+    else if (filter === "notAdded") list = list.filter((r) => !connectedIds.has(r.full_name));
+    else if (filter === "private") list = list.filter((r) => r.private);
+    else if (filter === "public") list = list.filter((r) => !r.private);
+    const q = query.trim().toLowerCase();
+    if (q) {
+      list = list.filter(
+        (r) => r.full_name.toLowerCase().includes(q) || r.owner.toLowerCase().includes(q),
+      );
+    }
+    if (sort === "stars") list.sort((a, b) => b.stargazers_count - a.stargazers_count);
+    else if (sort === "name") list.sort((a, b) => a.full_name.localeCompare(b.full_name));
+    else
+      list.sort((a, b) => {
+        const at = a.updated_at ? new Date(a.updated_at).getTime() : 0;
+        const bt = b.updated_at ? new Date(b.updated_at).getTime() : 0;
+        return bt - at;
+      });
+    return list;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repos, connectedQuery.data, filter, query, sort]);
+
+  const hasActiveFilter = filter !== "all" || query.trim().length > 0;
+
   const reconcileQuery = useQuery({
     queryKey: ["github", "reconcile"],
     queryFn: () => listInstallations(),

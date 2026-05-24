@@ -32,12 +32,14 @@ export const Route = createFileRoute("/auth/github/callback")({
           process.env.PUBLIC_APP_URL ?? `${url.protocol}//${url.host}`;
 
         if (!code || !state) {
+          console.error("[github-oauth-callback] missing code/state", { url: request.url, hasCode: !!code, hasState: !!state });
           return Response.redirect(`${origin}/dashboard/repos?error=missing_code`, 302);
         }
 
         const secret = process.env.SUPABASE_SERVICE_ROLE_KEY!;
         const userId = verifyState(state, secret);
         if (!userId) {
+          console.error("[github-oauth-callback] state verification failed", { state });
           return Response.redirect(`${origin}/dashboard/repos?error=bad_state`, 302);
         }
 
@@ -57,7 +59,7 @@ export const Route = createFileRoute("/auth/github/callback")({
           error?: string;
         };
         if (!tokenJson.access_token) {
-          console.error("GitHub token exchange failed", tokenJson);
+          console.error("[github-oauth-callback] token exchange failed", { tokenJson, redirectUri: `${origin}/auth/github/callback` });
           return Response.redirect(`${origin}/dashboard/repos?error=token_exchange`, 302);
         }
 
@@ -83,7 +85,7 @@ export const Route = createFileRoute("/auth/github/callback")({
             { onConflict: "user_id" },
           );
         if (error) {
-          console.error("Failed to store github credentials", error);
+          console.error("[github-oauth-callback] failed to store credentials", { error, userId });
           return Response.redirect(`${origin}/dashboard/repos?error=store`, 302);
         }
 

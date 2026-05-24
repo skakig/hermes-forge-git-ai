@@ -1,43 +1,56 @@
-# Make the primary CTAs actually work
+## What's actually happening
 
-## The problem
+Your network log confirms the server function works and returns a valid GitHub authorize URL. The OAuth App is a classic OAuth App with the correct callback URL registered. So GitHub itself should accept the request.
 
-"Ignite the Forge" and "Connect a repository" both link to `/dashboard/repos`. That route's parent (`src/routes/dashboard.tsx`) guards with `supabase.auth.getSession()` and, when there's no session, redirects to `/?redirect=/dashboard/repos`. The homepage has no sign-in UI, so the user lands on the marketing page again and the CTAs appear broken. There is no `/login` route in the app at all.
+The most likely cause of the "blank screen" is environment mixing:
 
-## What I'll build
+- You're testing inside the **preview** iframe (`lovableproject.com`).
+- The OAuth `redirect_uri` is hardcoded to the **published** URL (`hermes-forge-git-ai.lovable.app`) — it has to be, because GitHub only allows the one callback URL you registered.
+- After GitHub redirects back, the callback runs on the published origin, stores the token, and redirects to `/dashboard/repos?connected=1` **on the published site**.
+- If your session isn't valid on that origin, the dashboard guard bounces you to `/login`. If anything in the callback fails, it lands on `/dashboard/repos?error=…` — but the page currently **ignores those params silently**, so it just looks blank/unchanged.
 
-### 1. New `/login` route (`src/routes/login.tsx`)
-- Polished card matching the cyber-desert aesthetic (glass surface, ember accents, rune-grid backdrop).
-- Tabs: **Sign in** and **Create account**.
-- Email + password form using `supabase.auth.signInWithPassword` / `signUp`.
-- "Continue with Google" button using `lovable.auth.signInWithOAuth("google", { redirect_uri: window.location.origin + "/login" })` (managed Lovable Cloud OAuth — no extra setup).
-- Reads `?redirect=` search param; after successful auth navigates to that path (default `/dashboard/repos`).
-- If already authenticated (`beforeLoad` session check), immediately redirect to the target.
-- Inline error messaging via toast + form-level message.
-- SEO `head()` with route-specific title/description.
+Today the page has zero feedback for either success or failure, so we're flying blind.
 
-### 2. New `/signup` route
-- Thin wrapper that renders the same component pre-switched to the Create account tab, so the marketing nav can offer both entry points cleanly. (Same file, shared component.)
+## Plan
 
-### 3. Wire CTAs through `/login`
-- `src/routes/dashboard.tsx` `beforeLoad`: redirect unauthenticated users to `/login?redirect=<location.href>` instead of `/`.
-- `src/components/marketing/MarketingShell.tsx`:
-  - "Sign in" button → `/login`.
-  - "Ignite the Forge" button → `/login?redirect=/dashboard/repos` (so a fresh visitor signs in and lands directly on the connect-repo screen).
-- `src/routes/index.tsx`: same treatment for the hero "Ignite the Forge" / "Connect a repository" CTAs and the final-CTA band.
-- `src/routes/pricing.tsx`: tier "Start" buttons → `/login?redirect=/dashboard/repos`.
+### 1. Surface OAuth result on `/dashboard/repos`
 
-### 4. Configure Google as a social provider
-- Call `supabase--configure_social_auth` with `providers: ["google"]` so the first Google sign-in doesn't fail with "provider not enabled". No keys required from the user (managed by Lovable Cloud).
+Edit `src/routes/dashboard.repos.tsx`:
 
-### 5. Auth state listener
-- Small `useEffect` in the login component subscribing to `supabase.auth.onAuthStateChange` to navigate on `SIGNED_IN` (covers the OAuth return trip).
+- Add `validateSearch` for `connected?: "1"` and `error?: string`.
+- On mount, read those params. If `error`, show a destructive `<Alert>` at the top with a human-readable message keyed off the code (`missing_code`, `bad_state`, `token_exchange`, `store`) and the raw code for debugging. If `connected=1`, show a success toast + green banner.
+- Clean the query string after reading (so refresh doesn't re-fire).
+
+This alone will tell us exactly which failure path you're hitting — no more guessing.
+
+### 2. Add diagnostic logging in the callback
+
+Edit `src/routes/auth.github.callback.ts`:
+
+- `console.error` with a `[github-oauth-callback]` prefix on every early-return path, including the request URL, the GitHub error body (when token exchange fails), and the Supabase error (when the upsert fails).
+
+These show up in `stack_modern--server-function-logs`, so after one more attempt I can read exactly why it failed.
+
+### 3. Make the published-vs-preview boundary explicit
+
+Edit `src/components/forge/RepoCard.tsx` area / the two Connect buttons in `dashboard.repos.tsx`:
+
+- Detect `window.location.hostname` — if it's a `lovableproject.com` (preview) host, show a small note above the Connect button: "GitHub redirects back to the published site. [Open published dashboard ↗]" linking to `https://hermes-forge-git-ai.lovable.app/dashboard/repos`.
+- This stops you from chasing a flow that's structurally going to bounce origins.
+
+### 4. (Optional, only if step 1 reveals it's needed) Loosen the state TTL
+
+The state token expires 10 minutes after issue. If you sit on the GitHub consent screen, you'll get `bad_state` on return. If step 1 shows that's the actual error, bump TTL to 30 minutes.
 
 ## Out of scope
-- No changes to the GitHub OAuth flow itself, the Hermes API wrapper, or any dashboard pages beyond the redirect target. The GitHub "Connect repo" button on `/dashboard/repos` is already wired and will work the moment the user has a session.
-- No password reset / email verification UI in this pass (email confirmation remains the Supabase default; if you want auto-confirm during testing, say the word).
 
-## Files touched
-- **New:** `src/routes/login.tsx`, `src/routes/signup.tsx`
-- **Edited:** `src/routes/dashboard.tsx`, `src/components/marketing/MarketingShell.tsx`, `src/routes/index.tsx`, `src/routes/pricing.tsx`
-- **Config:** enable Google social auth provider
+- No DB changes.
+- No changes to the server function that mints the URL — it's correct.
+- No changes to the GitHub App credentials.
+
+## Files
+
+- Edited: `src/routes/dashboard.repos.tsx` (search schema + banners)
+- Edited: `src/routes/auth.github.callback.ts` (logging only)
+
+Once this ships, click Connect again on the **published site** (`hermes-forge-git-ai.lovable.app/dashboard/repos`), and either the green success banner appears or a red error banner tells us exactly which step failed — at which point I'll fix that specific step.

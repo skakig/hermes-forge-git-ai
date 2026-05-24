@@ -50,7 +50,17 @@ function LoginPage() {
   useEffect(() => {
     const { data } = supabase.auth.onAuthStateChange((event, session) => {
       if (event === "SIGNED_IN" && session) {
-        navigate({ to: target } as never);
+        let dest = target;
+        try {
+          const stashed = sessionStorage.getItem("hermes:postLoginRedirect");
+          if (stashed) {
+            dest = stashed;
+            sessionStorage.removeItem("hermes:postLoginRedirect");
+          }
+        } catch {
+          /* ignore */
+        }
+        navigate({ to: dest } as never);
       }
     });
     return () => data.subscription.unsubscribe();

@@ -1,5 +1,8 @@
 import { Link } from "@tanstack/react-router";
 import { LayoutDashboard, GitBranch, Target, Activity, Settings, Flame } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
+import { useServerFn } from "@tanstack/react-start";
+import { getDashboardStats } from "@/lib/dashboard.functions";
 
 const nav = [
   { to: "/dashboard", label: "Forge", icon: LayoutDashboard },
@@ -10,6 +13,13 @@ const nav = [
 ];
 
 export function Sidebar() {
+  const fetchStats = useServerFn(getDashboardStats);
+  const statsQuery = useQuery({
+    queryKey: ["forge", "stats"],
+    queryFn: () => fetchStats(),
+    refetchInterval: 10_000,
+  });
+  const activeLoops = statsQuery.data?.activeLoops ?? 0;
   return (
     <aside className="hidden md:flex w-64 shrink-0 flex-col border-r border-border/60 glass">
       <div className="p-6 flex items-center gap-3">
@@ -35,11 +45,15 @@ export function Sidebar() {
           </Link>
         ))}
       </nav>
-      <div className="p-4 m-3 rounded-xl border border-primary/30 bg-primary/5">
-        <div className="text-xs text-primary/90 uppercase tracking-wider mb-1">Background Mode</div>
-        <div className="text-sm text-foreground">Agent active · 3 loops running</div>
-        <div className="mt-2 size-2 rounded-full bg-primary pulse-ember" />
-      </div>
+      {activeLoops > 0 ? (
+        <div className="p-4 m-3 rounded-xl border border-primary/30 bg-primary/5">
+          <div className="text-xs text-primary/90 uppercase tracking-wider mb-1">Background Mode</div>
+          <div className="text-sm text-foreground">
+            Agent active · {activeLoops} loop{activeLoops === 1 ? "" : "s"} running
+          </div>
+          <div className="mt-2 size-2 rounded-full bg-primary pulse-ember" />
+        </div>
+      ) : null}
     </aside>
   );
 }

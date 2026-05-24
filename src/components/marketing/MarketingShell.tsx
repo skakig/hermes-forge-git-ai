@@ -5,9 +5,9 @@ import type { ReactNode } from "react";
 
 const navItems = [
   { to: "/", label: "Home", exact: true },
-  { to: "/how-it-works", label: "How it works" },
-  { to: "/features", label: "Features" },
-  { to: "/pricing", label: "Pricing" },
+  { to: "/how-it-works", label: "How it works", exact: false },
+  { to: "/features", label: "Features", exact: false },
+  { to: "/pricing", label: "Pricing", exact: false },
 ] as const;
 
 export function MarketingShell({ children }: { children: ReactNode }) {
@@ -28,7 +28,7 @@ export function MarketingShell({ children }: { children: ReactNode }) {
               <Link
                 key={item.to}
                 to={item.to}
-                activeOptions={{ exact: item.exact ?? false }}
+                activeOptions={{ exact: item.exact }}
                 className="px-3 py-2 rounded-md text-muted-foreground hover:text-foreground transition-colors data-[status=active]:text-foreground data-[status=active]:bg-primary/10"
               >
                 {item.label}

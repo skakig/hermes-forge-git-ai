@@ -1,12 +1,30 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { RepoCard } from "@/components/forge/RepoCard";
+import { RepoCard, RepoRow } from "@/components/forge/RepoCard";
+import {
+  RepoCommandBar,
+  type RepoFilter,
+  type RepoSort,
+  type RepoView,
+} from "@/components/forge/RepoCommandBar";
 import { Button } from "@/components/ui/button";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { AlertCircle, CheckCircle2, ExternalLink, Github, Plus, RefreshCw, Check, Link2 } from "lucide-react";
+import {
+  AlertCircle,
+  CheckCircle2,
+  ExternalLink,
+  Github,
+  Plus,
+  RefreshCw,
+  Link2,
+  LayoutGrid,
+  List,
+  Search,
+} from "lucide-react";
+import { cn } from "@/lib/utils";
 import { startGithubOAuth } from "@/lib/github-oauth.functions";
 import {
   getGithubConnection,

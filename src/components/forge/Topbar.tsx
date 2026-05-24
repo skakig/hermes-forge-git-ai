@@ -1,5 +1,6 @@
-import { Bell, Github, Search } from "lucide-react";
+import { Bell, Search } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { ConnectionStatusPill } from "./ConnectionStatus";
 
 export function Topbar() {
   return (
@@ -13,9 +14,7 @@ export function Topbar() {
       </div>
       <div className="flex items-center gap-2">
         <Button variant="ghost" size="icon"><Bell className="size-4" /></Button>
-        <Button variant="outline" size="sm" className="gap-2">
-          <Github className="size-4" /> Connected
-        </Button>
+        <ConnectionStatusPill />
         <div className="size-9 rounded-full ember-gradient grid place-items-center text-sm font-semibold text-primary-foreground">H</div>
       </div>
     </header>

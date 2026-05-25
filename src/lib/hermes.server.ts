@@ -163,7 +163,7 @@ export async function runPhase(ctx: PhaseCtx): Promise<PhasePatch> {
     case "checks_pending":
       return runChecksPending(ctx, token);
     case "diagnose_failure":
-      return runDiagnoseFailure(ctx);
+      return runDiagnoseFailure(ctx, token);
     case "repair_patch":
       return runPatch(ctx, token);
     default:

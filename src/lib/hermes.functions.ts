@@ -135,7 +135,7 @@ export const pollLoopStatus = createServerFn({ method: "POST" })
           installationId,
         });
         const { message, comment_kind, ...dbPatch } = patch;
-        const releasePatch: Record<string, unknown> = { ...dbPatch, phase_running: false };
+        const releasePatch = { ...dbPatch, phase_running: false };
         // Conditional advance: only commit if phase hasn't drifted underneath us.
         const { data: updated } = await supabaseAdmin
           .from("loops")

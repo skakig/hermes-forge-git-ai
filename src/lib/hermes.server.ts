@@ -978,6 +978,26 @@ async function runChecksPending(ctx: PhaseCtx, token: string): Promise<PhasePatc
   if (failed.length > 0) {
     const attempts = ctx.loop.attempt_count ?? 0;
     const max = ctx.loop.max_attempts ?? 3;
+    // Reconciliation: before we declare failure, ask GitHub whether the PR
+    // was actually merged anyway (auto-merge or human merge despite failing
+    // checks). If so, the loop is effectively complete and should NOT show
+    // as ERROR in the dashboard.
+    try {
+      const prState = await getPRState(token, repo.owner, repo.name, loop.pr_number);
+      if (prState.merged) {
+        return {
+          status: "completed",
+          phase: "completed",
+          checks_status: "merged_with_failures",
+          checks_payload: payload,
+          finished_at: new Date().toISOString(),
+          message: `PR #${loop.pr_number} was merged despite ${failed.length} failing check${failed.length === 1 ? "" : "s"} · review recommended`,
+          comment_kind: "completed",
+        };
+      }
+    } catch (e) {
+      console.error("getPRState failed during checks reconciliation:", e);
+    }
     if (attempts >= max) {
       return {
         status: "failed",

@@ -118,13 +118,19 @@ export type Database = {
       }
       loops: {
         Row: {
+          attempt_count: number
           branch: string | null
           bug_report: string | null
+          checks_payload: Json
+          checks_status: string | null
           created_at: string
           finished_at: string | null
           goals: string[]
           hermes_run_id: string | null
           id: string
+          last_error: string | null
+          max_attempts: number
+          next_run_at: string | null
           phase: string
           phase_running: boolean
           phase_started_at: string | null
@@ -140,13 +146,19 @@ export type Database = {
           user_id: string
         }
         Insert: {
+          attempt_count?: number
           branch?: string | null
           bug_report?: string | null
+          checks_payload?: Json
+          checks_status?: string | null
           created_at?: string
           finished_at?: string | null
           goals?: string[]
           hermes_run_id?: string | null
           id?: string
+          last_error?: string | null
+          max_attempts?: number
+          next_run_at?: string | null
           phase?: string
           phase_running?: boolean
           phase_started_at?: string | null
@@ -162,13 +174,19 @@ export type Database = {
           user_id: string
         }
         Update: {
+          attempt_count?: number
           branch?: string | null
           bug_report?: string | null
+          checks_payload?: Json
+          checks_status?: string | null
           created_at?: string
           finished_at?: string | null
           goals?: string[]
           hermes_run_id?: string | null
           id?: string
+          last_error?: string | null
+          max_attempts?: number
+          next_run_at?: string | null
           phase?: string
           phase_running?: boolean
           phase_started_at?: string | null

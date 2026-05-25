@@ -21,6 +21,7 @@ import { Route as DashboardReposRouteImport } from './routes/dashboard.repos'
 import { Route as DashboardGoalsRouteImport } from './routes/dashboard.goals'
 import { Route as DashboardActivityRouteImport } from './routes/dashboard.activity'
 import { Route as AuthGithubCallbackRouteImport } from './routes/auth.github.callback'
+import { Route as ApiPublicHermesWorkerRouteImport } from './routes/api/public/hermes-worker'
 
 const PricingRoute = PricingRouteImport.update({
   id: '/pricing',
@@ -82,6 +83,11 @@ const AuthGithubCallbackRoute = AuthGithubCallbackRouteImport.update({
   path: '/auth/github/callback',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiPublicHermesWorkerRoute = ApiPublicHermesWorkerRouteImport.update({
+  id: '/api/public/hermes-worker',
+  path: '/api/public/hermes-worker',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -95,6 +101,7 @@ export interface FileRoutesByFullPath {
   '/dashboard/repos': typeof DashboardReposRoute
   '/dashboard/settings': typeof DashboardSettingsRoute
   '/dashboard/': typeof DashboardIndexRoute
+  '/api/public/hermes-worker': typeof ApiPublicHermesWorkerRoute
   '/auth/github/callback': typeof AuthGithubCallbackRoute
 }
 export interface FileRoutesByTo {
@@ -108,6 +115,7 @@ export interface FileRoutesByTo {
   '/dashboard/repos': typeof DashboardReposRoute
   '/dashboard/settings': typeof DashboardSettingsRoute
   '/dashboard': typeof DashboardIndexRoute
+  '/api/public/hermes-worker': typeof ApiPublicHermesWorkerRoute
   '/auth/github/callback': typeof AuthGithubCallbackRoute
 }
 export interface FileRoutesById {
@@ -123,6 +131,7 @@ export interface FileRoutesById {
   '/dashboard/repos': typeof DashboardReposRoute
   '/dashboard/settings': typeof DashboardSettingsRoute
   '/dashboard/': typeof DashboardIndexRoute
+  '/api/public/hermes-worker': typeof ApiPublicHermesWorkerRoute
   '/auth/github/callback': typeof AuthGithubCallbackRoute
 }
 export interface FileRouteTypes {
@@ -139,6 +148,7 @@ export interface FileRouteTypes {
     | '/dashboard/repos'
     | '/dashboard/settings'
     | '/dashboard/'
+    | '/api/public/hermes-worker'
     | '/auth/github/callback'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -152,6 +162,7 @@ export interface FileRouteTypes {
     | '/dashboard/repos'
     | '/dashboard/settings'
     | '/dashboard'
+    | '/api/public/hermes-worker'
     | '/auth/github/callback'
   id:
     | '__root__'
@@ -166,6 +177,7 @@ export interface FileRouteTypes {
     | '/dashboard/repos'
     | '/dashboard/settings'
     | '/dashboard/'
+    | '/api/public/hermes-worker'
     | '/auth/github/callback'
   fileRoutesById: FileRoutesById
 }
@@ -176,6 +188,7 @@ export interface RootRouteChildren {
   HowItWorksRoute: typeof HowItWorksRoute
   LoginRoute: typeof LoginRoute
   PricingRoute: typeof PricingRoute
+  ApiPublicHermesWorkerRoute: typeof ApiPublicHermesWorkerRoute
   AuthGithubCallbackRoute: typeof AuthGithubCallbackRoute
 }
 
@@ -265,6 +278,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthGithubCallbackRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/public/hermes-worker': {
+      id: '/api/public/hermes-worker'
+      path: '/api/public/hermes-worker'
+      fullPath: '/api/public/hermes-worker'
+      preLoaderRoute: typeof ApiPublicHermesWorkerRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -295,18 +315,9 @@ const rootRouteChildren: RootRouteChildren = {
   HowItWorksRoute: HowItWorksRoute,
   LoginRoute: LoginRoute,
   PricingRoute: PricingRoute,
+  ApiPublicHermesWorkerRoute: ApiPublicHermesWorkerRoute,
   AuthGithubCallbackRoute: AuthGithubCallbackRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
   ._addFileTypes<FileRouteTypes>()
-
-import type { getRouter } from './router.tsx'
-import type { startInstance } from './start.ts'
-declare module '@tanstack/react-start' {
-  interface Register {
-    ssr: true
-    router: Awaited<ReturnType<typeof getRouter>>
-    config: Awaited<ReturnType<typeof startInstance.getOptions>>
-  }
-}

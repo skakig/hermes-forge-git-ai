@@ -1,78 +1,69 @@
-## What's broken
+What’s going on
 
-The agent successfully audited the repo, made a correct plan ("end turn on a Farkle after hot dice in `useGameLogic.ts`"), and opened draft PR #1. But the dashboard shows **FAILED** and no code was ever written, because of a client-side race condition we created — not a GitHub or AI failure.
+- Hermes is currently a request-driven agent, not a real background worker. The dashboard calls `pollLoopStatus`, and that one web request tries to run several slow phases: audit, plan, create PR, ask AI to edit files, push commits, then mark the PR ready.
+- That explains the waiting/reload behavior: GitHub may already have the PR/commits, but the dashboard only reflects success after the next poll/reload sees the database row updated.
+- The failed GitHub checks in your screenshots are Netlify/deploy checks on the target repo. Hermes can create code changes, but right now it does not read CI/deploy failure logs, diagnose them, and push a corrective commit. So “PR created” does not mean “PR is correct and deployable.”
+- The current patcher is also too shallow for true self-improvement: it picks up to 5 suspect files, asks the model to rewrite each file independently, and does not run tests/builds or inspect the resulting app before declaring the loop complete.
 
-Two pollers run in parallel every 5s on the active loop:
-- `useQuery({ refetchInterval: 5000 })` on `listLoops`
-- a separate `setInterval(5000)` calling `pollLoopStatus`
+Best way to make this actually auto-improve
 
-Each call to `pollLoopStatus` re-runs the current phase from scratch. Phases routinely take longer than 5s (Gemini audit + plan + 3 GitHub round-trips for draft_pr). With no per-loop lock, phases run concurrently:
-- Concurrent `runPlan` → 6+ "Plan ready" entries in your activity feed.
-- Concurrent `runDraftPr` → two `createBranch` calls hit GitHub. One wins (PR #1 created), the other gets **422 "Reference already exists"** or **422 "PR already exists for that branch"**. The losing call throws → `catch` in `pollLoopStatus` flips the whole loop to `status=failed`. Phases 4–7 (`patch`, `commit`, `ready`) never run, so your `useGameLogic.ts` is never actually edited.
+1. Replace request-driven polling with a durable job queue
+   - Starting a loop should enqueue work and return immediately.
+   - A worker endpoint processes one phase/job at a time with locks, retries, and persisted progress.
+   - The dashboard becomes a live monitor, not the thing responsible for making Hermes run.
 
-## Plan
+2. Add a CI/check feedback phase
+   - After pushing commits, Hermes should poll GitHub check runs/statuses for the PR branch.
+   - If checks fail, it should collect the failing check names and links/log excerpts where available.
+   - The loop should not show “completed” until checks are green, explicitly blocked, or max repair attempts are exhausted.
 
-### 1. Acquire a per-loop phase lock (server-side, atomic)
+3. Add a repair loop
+   - New phases: `checks_pending`, `diagnose_failure`, `repair_patch`, `repair_commit`, then back to `checks_pending`.
+   - Store `attempt_count`, `last_error`, and failed check metadata on the loop.
+   - Cap attempts, for example 3 repair attempts per PR, so it does not thrash forever.
 
-Add two columns to `loops`:
-- `phase_running boolean not null default false`
-- `phase_started_at timestamptz null`
+4. Improve code-edit quality
+   - Instead of editing isolated files blindly, have Hermes read relevant neighboring files and config files: package.json, build config, deploy config, tests, and files referenced by failing logs.
+   - Prefer small targeted patches and commit messages that explain the fix.
+   - If no confident patch is possible, leave the PR open with a clear “needs human review” status rather than claiming success.
 
-In `pollLoopStatus`, before running a phase, do a conditional UPDATE:
+5. Make dashboard statuses honest
+   - Split PR state from agent state:
+     - PR opened
+     - Commits pushed
+     - Checks running
+     - Checks failed; repairing
+     - Ready for review
+     - Blocked
+   - Show the GitHub PR link even when the agent fails.
+   - Add a “Resume/Retry repair” action for failed or blocked loops.
 
-```
-update loops
-   set phase_running = true, phase_started_at = now()
- where id = $1 and phase_running = false
-returning *;
-```
+Technical implementation plan
 
-If no row comes back, another worker holds the lock → return early (no error, no retry, no activity event). On success, run the phase, then release the lock in a `finally` block (`phase_running = false`). Also release stale locks > 90s old on acquisition so a crashed worker can't wedge the loop forever.
+- Database migration:
+  - Add queue/job metadata, e.g. `loop_jobs` or equivalent columns on `loops`.
+  - Add fields such as `attempt_count`, `max_attempts`, `last_error`, `checks_status`, `checks_payload`, `next_run_at`.
+  - Keep RLS scoped to the authenticated user.
 
-This is the real fix. Even if both pollers fire, only one phase ever runs.
+- Server functions/routes:
+  - Keep `startHermesLoop` as the user-facing function that creates the loop and enqueues the first job.
+  - Add a secured worker route under `/api/public/...` for scheduled/background processing, protected by a secret header.
+  - Add server helpers to list PR check runs/statuses from GitHub.
+  - Add phase runners for check polling and repair attempts.
 
-### 2. Conditional phase advancement
+- GitHub integration:
+  - Fetch PR head SHA and associated check runs/statuses.
+  - Treat Netlify/deploy failures as a first-class signal.
+  - Store failing check names, URLs, conclusion, and summary in the loop activity.
 
-When writing the result, also gate on the phase we started from:
+- Dashboard:
+  - Show the real phase/check state instead of only `completed`/`failed`.
+  - Link directly to failed checks and the PR.
+  - Add retry/resume for blocked loops.
 
-```
-update loops set phase = $next, ... where id = $1 and phase = $expected;
-```
+Expected outcome
 
-Belt-and-suspenders against any other source of duplicate runs.
-
-### 3. Auto-chain phases inside a single poll
-
-Right now each phase needs its own poll cycle (~5s per phase × 7 phases = 35s minimum, often longer). Inside `pollLoopStatus`, after a successful phase, immediately loop and run the next phase too — up to a soft cap (e.g. 4 phases or 25s wall clock per request, whichever comes first), then return. This makes a healthy loop finish in ~1 request instead of 7, and removes most of the window where racing is even possible.
-
-### 4. Kill the redundant client poller
-
-Remove the `setInterval` in `LoopControl` — `loopsQuery` already refetches every 5s, and we'll explicitly call `pollFn` once per refetch when the loop is still running. One poller, not two.
-
-### 5. Make `runDraftPr` itself idempotent
-
-Belt #3:
-- Use a stable branch name based on `loop.id` (e.g. `forge/auto-${loop.id.slice(0,8)}`) instead of `Date.now()`. If `createBranch` returns 422 "Reference already exists" AND we already wrote a `pr_number` on the loop, treat it as success and move on. If it returns 422 because of the branch but we have no PR yet, fetch the existing branch SHA and continue.
-- If `createPullRequest` returns 422 "A pull request already exists for…", fetch the existing PR and use its number/url instead of failing.
-
-### 6. Friendlier error surface
-
-When a phase truly fails (not a benign 422), the activity event already shows the cause. Leave the loop in `phase=error` but also display the **last successful PR url** in the dashboard's failed-loop card so the user can see "the draft PR exists, only the patch phase failed" — and add a **Resume** button that resets `phase_running=false` and rewinds `phase` to the failed one so the user can retry without re-igniting.
-
-## What this gets you
-
-After the fix, igniting on `skakig/dice-strategy-oracle` with the Farkle bug report should:
-1. Audit (1 Gemini call)
-2. Plan ("end turn on Farkle after hot dice in useGameLogic.ts")
-3. Open draft PR (the one you already see)
-4. **Edit `useGameLogic.ts` for real** via Gemini's `apply_edit` tool call → commit on the branch
-5. Post a summary comment on the PR
-6. Flip PR from draft → ready for review
-
-End-to-end in ~30–60s, no double-runs, no 422s, real diff in the PR for you to review and merge.
-
-## Out of scope
-
-- Re-trying failed AI phases (next iteration; for now Resume button is enough).
-- Multi-file refactors that need cross-file reasoning beyond the 5-file-per-phase cap.
-- Webhook-driven progression (everything still poll-driven from the dashboard).
+- Hermes will no longer depend on the browser tab being open or a manual reload to continue.
+- The dashboard will show accurate progress while GitHub checks run.
+- A failed Netlify check becomes input for another Hermes repair attempt instead of the endpoint marking the loop done.
+- The system becomes a real self-improvement cycle: propose change, push PR, observe CI/deploy, repair, repeat until green or safely blocked.

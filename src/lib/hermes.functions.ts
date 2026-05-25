@@ -2,7 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";
-import { runPhase, type LoopRow, type RepoRow } from "./hermes.server";
+import { advanceLoopOnce } from "./hermes.server";
 
 async function getInstallationIdForUser(userId: string): Promise<number> {
   const { data } = await supabaseAdmin
@@ -78,107 +78,64 @@ export const pollLoopStatus = createServerFn({ method: "POST" })
   .inputValidator((input) => z.object({ loop_id: z.string().uuid() }).parse(input))
   .handler(async ({ context, data }) => {
     const { supabase, userId } = context;
-
-    const { data: initialLoop } = await supabase
+    // Verify ownership first.
+    const { data: owned } = await supabase
       .from("loops")
-      .select("id, user_id, repository_id, status, phase, branch, goals, bug_report, plan, suspect_files, pr_number, pr_url")
+      .select("id")
       .eq("id", data.loop_id)
       .eq("user_id", userId)
-      .single();
-    if (!initialLoop) throw new Error("Loop not found");
-    if (initialLoop.status !== "running") return { loop: initialLoop };
+      .maybeSingle();
+    if (!owned) throw new Error("Loop not found");
 
-    const { data: repo } = await supabase
-      .from("repositories")
-      .select("id, full_name, owner, name, default_branch")
-      .eq("id", initialLoop.repository_id)
-      .single();
-    if (!repo) throw new Error("Repository not found for loop");
-
-    const installationId = await getInstallationIdForUser(userId);
-
-    // Auto-chain a few phases per poll so a healthy loop finishes in ~1 request
-    // instead of 7. Hard ceilings prevent runaway calls.
+    // Auto-chain phases (each one acquires its own lock + advances once).
     const MAX_PHASES_PER_POLL = 4;
     const MAX_WALL_MS = 25_000;
-    const STALE_LOCK_MS = 90_000;
     const startTs = Date.now();
-    let loop = initialLoop as LoopRow;
-
+    let loop = null;
     for (let i = 0; i < MAX_PHASES_PER_POLL; i++) {
       if (Date.now() - startTs > MAX_WALL_MS) break;
-      if (loop.status !== "running") break;
-
-      // Atomic lock acquisition: only one worker can flip phase_running=false→true.
-      // Also reclaim stale locks (worker crashed mid-phase).
-      const staleCutoff = new Date(Date.now() - STALE_LOCK_MS).toISOString();
-      const { data: locked } = await supabaseAdmin
-        .from("loops")
-        .update({ phase_running: true, phase_started_at: new Date().toISOString() })
-        .eq("id", loop.id)
-        .eq("phase", loop.phase)
-        .or(`phase_running.eq.false,phase_started_at.lt.${staleCutoff}`)
-        .select("id, user_id, repository_id, status, phase, branch, goals, bug_report, plan, suspect_files, pr_number, pr_url")
-        .maybeSingle();
-
-      if (!locked) {
-        // Another worker holds the lock, or phase already advanced. Bail quietly.
-        break;
-      }
-      loop = locked as LoopRow;
-      const phaseFrom = loop.phase;
-
-      try {
-        const patch = await runPhase({
-          loop,
-          repo: repo as RepoRow,
-          installationId,
-        });
-        const { message, comment_kind, ...dbPatch } = patch;
-        const releasePatch = { ...dbPatch, phase_running: false };
-        // Conditional advance: only commit if phase hasn't drifted underneath us.
-        const { data: updated } = await supabaseAdmin
-          .from("loops")
-          .update(releasePatch)
-          .eq("id", loop.id)
-          .eq("phase", phaseFrom)
-          .select("id, user_id, repository_id, status, phase, branch, goals, bug_report, plan, suspect_files, pr_number, pr_url")
-          .maybeSingle();
-        await supabaseAdmin.from("activity_events").insert({
-          user_id: userId,
-          loop_id: loop.id,
-          repository_id: loop.repository_id,
-          kind: comment_kind ?? "progress",
-          message,
-          metadata: { phase_from: phaseFrom, phase_to: dbPatch.phase ?? phaseFrom },
-        });
-        if (updated) loop = updated as LoopRow;
-        // If this phase didn't advance the loop (e.g. terminal), stop.
-        if (!dbPatch.phase || dbPatch.phase === phaseFrom) break;
-        if (dbPatch.status && dbPatch.status !== "running") break;
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        await supabaseAdmin
-          .from("loops")
-          .update({
-            status: "failed",
-            phase: "error",
-            phase_running: false,
-            finished_at: new Date().toISOString(),
-          })
-          .eq("id", loop.id);
-        await supabaseAdmin.from("activity_events").insert({
-          user_id: userId,
-          loop_id: loop.id,
-          repository_id: loop.repository_id,
-          kind: "error",
-          message: `Phase "${phaseFrom}" failed: ${msg.slice(0, 240)}`,
-        });
-        throw new Error(`phase_failed: ${msg}`);
-      }
+      const res = await advanceLoopOnce(data.loop_id);
+      loop = res.loop;
+      if (!res.advanced) break;
+      if (loop?.status !== "running") break;
     }
-
     return { loop };
+  });
+
+export const resumeLoop = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input) => z.object({ loop_id: z.string().uuid() }).parse(input))
+  .handler(async ({ context, data }) => {
+    const { supabase, userId } = context;
+    // Owner check.
+    const { data: row } = await supabase
+      .from("loops")
+      .select("id, status, phase, pr_number")
+      .eq("id", data.loop_id)
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (!row) throw new Error("Loop not found");
+    // Resume: rewind to checks_pending if we have a PR, else diagnose.
+    const newPhase = row.pr_number ? "checks_pending" : "audit";
+    const { error } = await supabaseAdmin
+      .from("loops")
+      .update({
+        status: "running",
+        phase: newPhase,
+        phase_running: false,
+        last_error: null,
+        finished_at: null,
+        next_run_at: new Date().toISOString(),
+      })
+      .eq("id", data.loop_id);
+    if (error) throw new Error(error.message);
+    await supabaseAdmin.from("activity_events").insert({
+      user_id: userId,
+      loop_id: data.loop_id,
+      kind: "progress",
+      message: `Loop resumed at phase "${newPhase}"`,
+    });
+    return { ok: true };
   });
 
 export const cancelLoop = createServerFn({ method: "POST" })

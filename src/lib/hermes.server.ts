@@ -11,8 +11,10 @@ import {
   createPullRequest,
   addPRComment,
   markPRReadyForReview,
+  listPRChecks,
   type RepoTreeEntry,
 } from "./github-app.server";
+import { supabaseAdmin } from "@/integrations/supabase/client.server";
 
 const AI_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
 const DEFAULT_MODEL = "google/gemini-2.5-pro";
@@ -100,6 +102,10 @@ export type LoopRow = {
   suspect_files: string[];
   pr_number: number | null;
   pr_url: string | null;
+  attempt_count?: number;
+  max_attempts?: number;
+  checks_status?: string | null;
+  checks_payload?: import("@/integrations/supabase/types").Json | null;
 };
 
 export type RepoRow = {
@@ -120,6 +126,11 @@ export type PhasePatch = {
   pr_url?: string;
   pr_is_draft?: boolean;
   finished_at?: string;
+  attempt_count?: number;
+  last_error?: string | null;
+  checks_status?: string | null;
+  checks_payload?: import("@/integrations/supabase/types").Json;
+  next_run_at?: string | null;
   message: string;
   comment_kind?: "progress" | "pr_opened" | "completed" | "error";
 };
@@ -147,6 +158,12 @@ export async function runPhase(ctx: PhaseCtx): Promise<PhasePatch> {
       return runCommit(ctx, token);
     case "ready":
       return runReady(ctx, token);
+    case "checks_pending":
+      return runChecksPending(ctx, token);
+    case "diagnose_failure":
+      return runDiagnoseFailure(ctx);
+    case "repair_patch":
+      return runPatch(ctx, token);
     default:
       return { message: `Phase "${ctx.loop.phase}" has no runner.`, comment_kind: "progress" };
   }
@@ -506,6 +523,18 @@ async function runReady(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
       /* non-fatal */
     }
   }
+  // Don't declare victory yet — wait for CI/deploy checks.
+  if (loop.pr_number) {
+    return {
+      phase: "checks_pending",
+      pr_is_draft: false,
+      checks_status: "pending",
+      // Give CI a moment to register check runs before the first poll.
+      next_run_at: new Date(Date.now() + 20_000).toISOString(),
+      message: "PR ready for review · waiting on CI checks",
+      comment_kind: "progress",
+    };
+  }
   return {
     status: "completed",
     phase: "completed",
@@ -514,4 +543,329 @@ async function runReady(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
     message: "Loop complete · PR ready for review",
     comment_kind: "completed",
   };
+}
+
+// ---------------------------------------------------------------------------
+// CI feedback + self-repair
+// ---------------------------------------------------------------------------
+
+const CHECKS_POLL_WINDOW_MS = 12 * 60 * 1000; // give CI up to 12 minutes
+
+async function runChecksPending(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
+  const { repo, loop } = ctx;
+  if (!loop.pr_number) {
+    return {
+      status: "completed",
+      phase: "completed",
+      finished_at: new Date().toISOString(),
+      message: "No PR to monitor; marking complete.",
+      comment_kind: "completed",
+    };
+  }
+  const { runs, statuses, headSha } = await listPRChecks(
+    token,
+    repo.owner,
+    repo.name,
+    loop.pr_number,
+  );
+
+  const allChecks = [
+    ...runs.map((r) => ({
+      name: r.name,
+      state: r.status === "completed" ? (r.conclusion ?? "neutral") : "pending",
+      url: r.html_url,
+      summary: r.output_title ?? r.output_summary ?? null,
+    })),
+    ...statuses.map((s) => ({
+      name: s.context,
+      state: s.state,
+      url: s.target_url,
+      summary: s.description,
+    })),
+  ];
+
+  const failed = allChecks.filter((c) =>
+    ["failure", "error", "timed_out", "action_required", "cancelled"].includes(c.state),
+  );
+  const stillPending = allChecks.some((c) =>
+    ["pending", "queued", "in_progress"].includes(c.state),
+  );
+  const succeeded =
+    allChecks.length > 0 && !stillPending && failed.length === 0;
+
+  // Has CI even started? If no checks reported yet, keep waiting (up to window).
+  const noChecksYet = allChecks.length === 0;
+
+  // Time-bounded wait: don't poll forever if CI never reports.
+  const startedAt = ctx.loop.checks_payload && typeof (ctx.loop.checks_payload as { started_at?: string }).started_at === "string"
+    ? new Date((ctx.loop.checks_payload as { started_at: string }).started_at).getTime()
+    : Date.now();
+  const expired = Date.now() - startedAt > CHECKS_POLL_WINDOW_MS;
+
+  const payload = {
+    head_sha: headSha,
+    started_at: new Date(startedAt).toISOString(),
+    last_checked_at: new Date().toISOString(),
+    checks: allChecks,
+  } as unknown as import("@/integrations/supabase/types").Json;
+
+  if (succeeded) {
+    return {
+      status: "completed",
+      phase: "completed",
+      checks_status: "success",
+      checks_payload: payload,
+      finished_at: new Date().toISOString(),
+      message: `All ${allChecks.length} checks passed · PR ready to merge`,
+      comment_kind: "completed",
+    };
+  }
+
+  if (failed.length > 0) {
+    const attempts = ctx.loop.attempt_count ?? 0;
+    const max = ctx.loop.max_attempts ?? 3;
+    if (attempts >= max) {
+      return {
+        status: "failed",
+        phase: "blocked",
+        checks_status: "failure",
+        checks_payload: payload,
+        last_error: `Checks still failing after ${attempts} repair attempts: ${failed.map((f) => f.name).join(", ")}`,
+        finished_at: new Date().toISOString(),
+        message: `Giving up after ${attempts} repair attempt${attempts === 1 ? "" : "s"} · ${failed.length} check${failed.length === 1 ? "" : "s"} still failing`,
+        comment_kind: "error",
+      };
+    }
+    return {
+      phase: "diagnose_failure",
+      checks_status: "failure",
+      checks_payload: payload,
+      next_run_at: new Date().toISOString(),
+      message: `${failed.length} check${failed.length === 1 ? "" : "s"} failed · diagnosing (attempt ${attempts + 1}/${max})`,
+      comment_kind: "progress",
+    };
+  }
+
+  if (noChecksYet && expired) {
+    // CI never spoke up. Consider PR ready and let the human take it from here.
+    return {
+      status: "completed",
+      phase: "completed",
+      checks_status: "no_checks",
+      checks_payload: payload,
+      finished_at: new Date().toISOString(),
+      message: "No CI checks reported in 12 minutes · marking PR ready for review",
+      comment_kind: "completed",
+    };
+  }
+
+  // Still pending — schedule the next poll.
+  return {
+    checks_status: "pending",
+    checks_payload: payload,
+    next_run_at: new Date(Date.now() + 30_000).toISOString(),
+    message: `Checks running · ${allChecks.filter((c) => ["pending", "queued", "in_progress"].includes(c.state)).length} pending`,
+    comment_kind: "progress",
+  };
+}
+
+async function runDiagnoseFailure(ctx: PhaseCtx): Promise<PhasePatch> {
+  const { loop } = ctx;
+  const payload = (loop.checks_payload ?? {}) as {
+    checks?: Array<{ name: string; state: string; url: string | null; summary: string | null }>;
+  };
+  const failed = (payload.checks ?? []).filter((c) =>
+    ["failure", "error", "timed_out", "action_required", "cancelled"].includes(c.state),
+  );
+  const failureDigest = failed
+    .map((f) => `- ${f.name} (${f.state})${f.summary ? `: ${f.summary.slice(0, 240)}` : ""}`)
+    .join("\n");
+
+  const ai = await callAI({
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are Hermes. A PR you opened has failing CI/deploy checks. Given the previous plan and the failure summaries, propose a corrective patch focused ONLY on the failing checks. Identify up to 5 likely files to modify (repo-relative paths). Be specific and conservative — fix the failure, do not refactor.",
+      },
+      {
+        role: "user",
+        content: [
+          `Original hypothesis: ${loop.plan?.hypothesis ?? "(none)"}`,
+          `Original proposed change: ${loop.plan?.proposed_change ?? "(none)"}`,
+          `Previously touched files:\n${(loop.suspect_files ?? []).map((f) => `- ${f}`).join("\n") || "(none)"}`,
+          ``,
+          `Failing checks:\n${failureDigest || "(no detail available)"}`,
+        ].join("\n"),
+      },
+    ],
+    tool: {
+      name: "submit_repair_plan",
+      description: "Submit a corrective plan for the failing checks.",
+      parameters: {
+        type: "object",
+        properties: {
+          diagnosis: { type: "string", description: "1-3 sentence root cause." },
+          suspect_files: {
+            type: "array",
+            items: { type: "string" },
+            description: "Up to 5 source file paths (repo-relative) to modify.",
+          },
+          proposed_fix: { type: "string", description: "Plain-English description of the fix." },
+        },
+        required: ["diagnosis", "suspect_files", "proposed_fix"],
+        additionalProperties: false,
+      },
+    },
+  });
+  const repair = ai.tool as
+    | { diagnosis: string; suspect_files: string[]; proposed_fix: string }
+    | null;
+  if (!repair) throw new Error("diagnose_missing_tool_call");
+  const suspect = (repair.suspect_files ?? []).filter(Boolean).slice(0, 5);
+  const attempts = (loop.attempt_count ?? 0) + 1;
+  return {
+    phase: "repair_patch",
+    attempt_count: attempts,
+    suspect_files: suspect,
+    plan: {
+      ...(loop.plan ?? {}),
+      hypothesis: repair.diagnosis,
+      proposed_change: repair.proposed_fix,
+      suspect_files: suspect,
+    },
+    message: `Diagnosis · ${repair.diagnosis.slice(0, 120)}`,
+    comment_kind: "progress",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Shared phase advancement worker — used by both pollLoopStatus and the cron.
+// Acquires a lock, runs a single phase, releases it. Returns the updated loop.
+// ---------------------------------------------------------------------------
+
+const STALE_LOCK_MS = 90_000;
+
+const LOOP_SELECT =
+  "id, user_id, repository_id, status, phase, branch, goals, bug_report, plan, suspect_files, pr_number, pr_url, attempt_count, max_attempts, checks_status, checks_payload, next_run_at";
+
+export async function advanceLoopOnce(loopId: string): Promise<{
+  loop: LoopRow | null;
+  advanced: boolean;
+  reason?: string;
+}> {
+  const { data: row } = await supabaseAdmin
+    .from("loops")
+    .select(LOOP_SELECT)
+    .eq("id", loopId)
+    .maybeSingle();
+  if (!row) return { loop: null, advanced: false, reason: "loop_not_found" };
+  const loop = row as unknown as LoopRow;
+  if (loop.status !== "running") return { loop, advanced: false, reason: "loop_not_running" };
+
+  const nextRunAt = (row as { next_run_at?: string | null }).next_run_at;
+  if (nextRunAt && new Date(nextRunAt).getTime() > Date.now()) {
+    return { loop, advanced: false, reason: "not_due" };
+  }
+
+  const { data: repo } = await supabaseAdmin
+    .from("repositories")
+    .select("id, full_name, owner, name, default_branch")
+    .eq("id", loop.repository_id)
+    .maybeSingle();
+  if (!repo) return { loop, advanced: false, reason: "repo_not_found" };
+
+  const { data: install } = await supabaseAdmin
+    .from("github_installations")
+    .select("installation_id")
+    .eq("user_id", loop.user_id)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (!install) return { loop, advanced: false, reason: "no_installation" };
+
+  // Lock the row for this phase.
+  const staleCutoff = new Date(Date.now() - STALE_LOCK_MS).toISOString();
+  const { data: locked } = await supabaseAdmin
+    .from("loops")
+    .update({ phase_running: true, phase_started_at: new Date().toISOString() })
+    .eq("id", loop.id)
+    .eq("phase", loop.phase)
+    .or(`phase_running.eq.false,phase_started_at.lt.${staleCutoff}`)
+    .select(LOOP_SELECT)
+    .maybeSingle();
+  if (!locked) return { loop, advanced: false, reason: "locked" };
+
+  const lockedLoop = locked as unknown as LoopRow;
+  const phaseFrom = lockedLoop.phase;
+
+  try {
+    const patch = await runPhase({
+      loop: lockedLoop,
+      repo: repo as RepoRow,
+      installationId: Number((install as { installation_id: number | string }).installation_id),
+    });
+    const { message, comment_kind, ...dbPatch } = patch;
+    // If the patch didn't set next_run_at, advancing the phase should make the
+    // loop immediately due so the next worker tick picks it up.
+    const next_run_at = dbPatch.next_run_at !== undefined
+      ? dbPatch.next_run_at
+      : dbPatch.phase
+      ? new Date().toISOString()
+      : null;
+    const releasePatch = { ...dbPatch, phase_running: false, next_run_at };
+    const { data: updated } = await supabaseAdmin
+      .from("loops")
+      .update(releasePatch)
+      .eq("id", lockedLoop.id)
+      .eq("phase", phaseFrom)
+      .select(LOOP_SELECT)
+      .maybeSingle();
+    await supabaseAdmin.from("activity_events").insert({
+      user_id: lockedLoop.user_id,
+      loop_id: lockedLoop.id,
+      repository_id: lockedLoop.repository_id,
+      kind: comment_kind ?? "progress",
+      message,
+      metadata: { phase_from: phaseFrom, phase_to: dbPatch.phase ?? phaseFrom },
+    });
+    return { loop: (updated as unknown as LoopRow) ?? lockedLoop, advanced: true };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    await supabaseAdmin
+      .from("loops")
+      .update({
+        status: "failed",
+        phase: "error",
+        phase_running: false,
+        last_error: msg.slice(0, 1000),
+        finished_at: new Date().toISOString(),
+      })
+      .eq("id", lockedLoop.id);
+    await supabaseAdmin.from("activity_events").insert({
+      user_id: lockedLoop.user_id,
+      loop_id: lockedLoop.id,
+      repository_id: lockedLoop.repository_id,
+      kind: "error",
+      message: `Phase "${phaseFrom}" failed: ${msg.slice(0, 240)}`,
+    });
+    return { loop: lockedLoop, advanced: false, reason: `error:${msg.slice(0, 100)}` };
+  }
+}
+
+export async function advanceDueLoops(limit = 10): Promise<{ processed: number; advanced: number }> {
+  const { data: due } = await supabaseAdmin
+    .from("loops")
+    .select("id")
+    .eq("status", "running")
+    .eq("phase_running", false)
+    .lte("next_run_at", new Date().toISOString())
+    .order("next_run_at", { ascending: true })
+    .limit(limit);
+  let advanced = 0;
+  for (const r of due ?? []) {
+    const res = await advanceLoopOnce((r as { id: string }).id);
+    if (res.advanced) advanced++;
+  }
+  return { processed: (due ?? []).length, advanced };
 }

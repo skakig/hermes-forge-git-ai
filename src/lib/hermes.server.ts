@@ -403,12 +403,38 @@ function renderPlanMarkdown(loop: LoopRow): string {
 // common "deploy fails because the file no longer parses" cycle.
 function sanityCheck(path: string, contents: string): string | null {
   if (!contents || contents.length < 2) return "file is empty or too short";
+  // Catch common AI-output artifacts that produce instant build failures.
+  // These run before language-specific checks so they apply to all file types.
+  if (/^\uFEFF?\s*```/.test(contents)) return "starts with a markdown code fence (```)";
+  if (/\n```\s*$/.test(contents)) return "ends with a trailing markdown code fence (```)";
+  if (/^\uFEFF?\s*(?:Here(?:'s| is)|Sure[,!]|Below is|I('?| ?'?ve| will)|Okay[,.])/i.test(contents)) {
+    return "starts with a chat-style preamble instead of code";
+  }
+  if (/\u0000/.test(contents)) return "contains null bytes";
+  if (/\uFFFD/.test(contents)) return "contains Unicode replacement characters (corrupt encoding)";
   if (/\.json$/i.test(path)) {
     try { JSON.parse(contents); return null; } catch (e) {
       return `invalid JSON: ${e instanceof Error ? e.message : String(e)}`;
     }
   }
   if (/\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(path)) {
+    // Triple quotes / leading garbage before the first real token — this is
+    // exactly the `'''import ...` failure mode that took down Netlify builds.
+    const head = contents.replace(/^\uFEFF/, "").slice(0, 200);
+    if (/^\s*'{3,}/.test(head)) return "file starts with stray quote characters (e.g. ''')";
+    if (/^\s*"{3,}/.test(head)) return "file starts with stray double-quote characters";
+    // First non-comment, non-blank line must look like valid TS/JS.
+    const firstCode = contents
+      .split(/\r?\n/)
+      .map((l) => l.replace(/^\s+/, ""))
+      .find((l) => l.length > 0 && !l.startsWith("//") && !l.startsWith("/*") && !l.startsWith("*"));
+    if (firstCode && !/^(import\b|export\b|const\b|let\b|var\b|function\b|class\b|type\b|interface\b|enum\b|declare\b|async\b|namespace\b|module\b|@|\/\*|\(|\{|"use |if\b|return\b)/.test(firstCode)) {
+      // Heuristic: a leading line that doesn't begin like JS is suspicious.
+      // Allow JSX returns / arrow IIFEs by checking for "<" too.
+      if (!/^[<;]/.test(firstCode)) {
+        return `first code line does not look like valid JS/TS: ${firstCode.slice(0, 60)}`;
+      }
+    }
     // Strip strings + comments cheaply, then check bracket balance.
     const stripped = contents
       .replace(/\/\*[\s\S]*?\*\//g, "")
@@ -441,6 +467,65 @@ const PATCH_CONFIG_FILES = [
 ];
 
 const MAX_BUNDLE_CHARS = 40_000;
+
+// Try once to repair an AI edit that failed local validation. We send the
+// rejected file back with the exact validation error and ask for a corrected
+// full-file output. Only used pre-commit; never pushed unless it validates.
+async function repairProposedFile(args: {
+  path: string;
+  rejectedContents: string;
+  reason: string;
+  originalContents: string;
+  hypothesis: string;
+  proposedChange: string;
+}): Promise<string | null> {
+  const ai = await callAI({
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are Hermes. Your previous edit to a file was rejected by a pre-commit validator because the file is not valid JS/TS/JSON. " +
+          "Return the FULL corrected file contents. Make the MINIMUM change needed to make it valid while preserving the intent of the original edit. " +
+          "Never wrap the output in markdown code fences. Never add a preamble. Output must be raw source code only.",
+      },
+      {
+        role: "user",
+        content: [
+          `Path: ${args.path}`,
+          `Validator rejection reason: ${args.reason}`,
+          ``,
+          `Original hypothesis: ${args.hypothesis}`,
+          `Proposed change: ${args.proposedChange}`,
+          ``,
+          `REJECTED CONTENTS (your previous output):`,
+          "```",
+          args.rejectedContents.slice(0, 12000),
+          "```",
+          ``,
+          `ORIGINAL CONTENTS (on branch, before any edit):`,
+          "```",
+          args.originalContents.slice(0, 12000),
+          "```",
+        ].join("\n"),
+      },
+    ],
+    tool: {
+      name: "submit_repaired_file",
+      description: "Return the corrected full contents of the file.",
+      parameters: {
+        type: "object",
+        properties: {
+          new_contents: { type: "string", description: "Complete corrected file contents, raw source only." },
+          note: { type: "string" },
+        },
+        required: ["new_contents"],
+        additionalProperties: false,
+      },
+    },
+  });
+  const t = ai.tool as { new_contents?: string } | null;
+  return t?.new_contents ?? null;
+}
 
 async function runPatch(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
   const { repo, loop } = ctx;
@@ -592,16 +677,47 @@ async function runPatch(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
   // Apply edits: sanity-check first, then write only files that pass.
   let edits = 0;
   const skipped: string[] = [];
+  const validationNotes: string[] = [];
+  const repaired: string[] = [];
   for (const e of proposed) {
     const src = loaded.find((l) => l.path === e.path);
     if (!src) { skipped.push(`${e.path}: not in scope`); continue; }
     if (!e.changed || e.new_contents === src.content) continue;
-    const reason = sanityCheck(e.path, e.new_contents);
+    let toWrite = e.new_contents;
+    let reason = sanityCheck(e.path, toWrite);
+    if (reason) {
+      validationNotes.push(`${e.path}: rejected (${reason}); attempting one-shot repair…`);
+      try {
+        const repairedContents = await repairProposedFile({
+          path: e.path,
+          rejectedContents: toWrite,
+          reason,
+          originalContents: src.content,
+          hypothesis: loop.plan?.hypothesis ?? "",
+          proposedChange: loop.plan?.proposed_change ?? "",
+        });
+        if (repairedContents) {
+          const reason2 = sanityCheck(e.path, repairedContents);
+          if (!reason2) {
+            toWrite = repairedContents;
+            reason = null;
+            repaired.push(e.path);
+            validationNotes.push(`${e.path}: repair passed validation`);
+          } else {
+            validationNotes.push(`${e.path}: repair still invalid (${reason2})`);
+          }
+        } else {
+          validationNotes.push(`${e.path}: repair returned no contents`);
+        }
+      } catch (err) {
+        validationNotes.push(`${e.path}: repair errored (${err instanceof Error ? err.message : String(err)})`);
+      }
+    }
     if (reason) { skipped.push(`${e.path}: ${reason}`); continue; }
     try {
       await putFile(token, repo.owner, repo.name, {
         path: e.path,
-        content: e.new_contents,
+        content: toWrite,
         branch: loop.branch,
         message: `forge: ${(e.note || "automated edit").slice(0, 60)}`,
         sha: src.sha,
@@ -612,12 +728,47 @@ async function runPatch(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
     }
   }
 
+  // Append a repair-attempt note to the PR plan marker so the human reviewer
+  // (and the next Hermes attempt) can see what we tried and what was rejected.
+  if (validationNotes.length || repaired.length || skipped.length) {
+    try {
+      const markerPath = ".hermes/plan.md";
+      const existing = await getFileContents(token, repo.owner, repo.name, markerPath, loop.branch);
+      if (existing) {
+        const block = [
+          ``,
+          `---`,
+          ``,
+          `## Attempt ${(loop.attempt_count ?? 0) + (loop.phase === "repair_patch" ? 1 : 0)} · pre-commit validation`,
+          ``,
+          `- Edits applied: ${edits}`,
+          `- Files repaired in-flight: ${repaired.length ? repaired.map((p) => `\`${p}\``).join(", ") : "none"}`,
+          `- Skipped: ${skipped.length ? skipped.slice(0, 8).map((s) => `\`${s}\``).join("; ") : "none"}`,
+          ...(validationNotes.length ? [``, `**Validator notes:**`, ...validationNotes.map((n) => `- ${n}`)] : []),
+        ].join("\n");
+        await putFile(token, repo.owner, repo.name, {
+          path: markerPath,
+          content: existing.content + "\n" + block + "\n",
+          branch: loop.branch,
+          message: "chore(hermes): record validation notes",
+          sha: existing.sha,
+        });
+      }
+    } catch { /* non-fatal */ }
+  }
+
   const parts: string[] = [];
   parts.push(edits === 0 ? "No file edits were applied" : `Patched ${edits} file${edits === 1 ? "" : "s"}`);
+  if (repaired.length) parts.push(`${repaired.length} auto-repaired pre-commit`);
   if (skipped.length) parts.push(`${skipped.length} skipped: ${skipped.slice(0, 3).join("; ")}`);
   if (errors.length) parts.push(`${errors.length} load error${errors.length === 1 ? "" : "s"}`);
   return {
     phase: "commit",
+    plan: {
+      ...(loop.plan ?? {}),
+      // @ts-expect-error stored alongside plan for UI rendering
+      validation_notes: validationNotes.slice(-20),
+    },
     message: parts.join(" · "),
     comment_kind: "progress",
   };
@@ -845,6 +996,10 @@ async function runDiagnoseFailure(ctx: PhaseCtx, token: string): Promise<PhasePa
     ? failureLogs.map((f) => `### ${f.name}\n${f.log || "(no log)"}`).join("\n\n").slice(0, 8000)
     : failed.map((f) => `- ${f.name} (${f.state})${f.summary ? `: ${f.summary.slice(0, 240)}` : ""}`).join("\n");
 
+  // Pull explicit file:line:col references out of the build logs. These are
+  // deterministic hints that the AI's free-text plan must respect.
+  const extracted = extractErrorLocations(logDigest);
+
   // Read the files we touched last attempt + key build configs so the
   // model can reason about WHY the change broke the build.
   const fileBlocks: string[] = [];
@@ -877,10 +1032,13 @@ async function runDiagnoseFailure(ctx: PhaseCtx, token: string): Promise<PhasePa
           `Original hypothesis: ${loop.plan?.hypothesis ?? "(none)"}`,
           `Original proposed change: ${loop.plan?.proposed_change ?? "(none)"}`,
           `Previously touched files:\n${(loop.suspect_files ?? []).map((f) => `- ${f}`).join("\n") || "(none)"}`,
+          extracted.length
+            ? `\nEXPLICIT FILE:LINE ERRORS PARSED FROM LOGS (treat as ground truth):\n${extracted.map((e) => `- ${e.path}:${e.line}:${e.col} — ${e.message}`).join("\n")}`
+            : "",
           ``,
           `FAILING CHECKS / BUILD LOGS:\n${logDigest || "(no detail available)"}`,
           fileBlocks.length ? `\nCURRENT FILES ON BRANCH:\n${fileBlocks.join("\n\n")}` : "",
-        ].join("\n"),
+        ].filter(Boolean).join("\n"),
       },
     ],
     tool: {
@@ -906,7 +1064,12 @@ async function runDiagnoseFailure(ctx: PhaseCtx, token: string): Promise<PhasePa
     | { diagnosis: string; suspect_files: string[]; proposed_fix: string }
     | null;
   if (!repair) throw new Error("diagnose_missing_tool_call");
-  const suspect = (repair.suspect_files ?? []).filter(Boolean).slice(0, 5);
+  // Always include files the build log explicitly named, even if the AI
+  // forgot them. Deterministic hints beat AI inference.
+  const aiSuspects = (repair.suspect_files ?? []).filter(Boolean);
+  const explicit = extracted.map((e) => e.path);
+  const mergedSet = new Set<string>([...explicit, ...aiSuspects]);
+  const suspect = Array.from(mergedSet).slice(0, 5);
   const attempts = (loop.attempt_count ?? 0) + 1;
   return {
     phase: "repair_patch",
@@ -917,10 +1080,43 @@ async function runDiagnoseFailure(ctx: PhaseCtx, token: string): Promise<PhasePa
       hypothesis: repair.diagnosis,
       proposed_change: repair.proposed_fix,
       suspect_files: suspect,
+      // @ts-expect-error informational only — surfaced in UI
+      build_errors: extracted.slice(0, 10),
     },
     message: `Diagnosis · ${repair.diagnosis.slice(0, 120)}`,
     comment_kind: "progress",
   };
+}
+
+// Extract file:line:col error references from raw build logs.
+// Handles esbuild ("/path/to/file.ts:1:2: ERROR: ..."), tsc
+// ("path/to/file.ts(12,5): error TSxxxx"), and Vite variants.
+function extractErrorLocations(log: string): Array<{ path: string; line: number; col: number; message: string }> {
+  if (!log) return [];
+  const out: Array<{ path: string; line: number; col: number; message: string }> = [];
+  const seen = new Set<string>();
+  // esbuild / vite: /abs/or/rel/path.ts:LINE:COL: ERROR: message
+  const esbuild = /(?:^|\s)((?:\/opt\/build\/repo\/)?(?:src|app|lib|pages|components|hooks|utils|server|routes)[^\s:()]*\.(?:tsx?|jsx?|mjs|cjs|json|toml|yaml|yml)):(\d+):(\d+)(?::\s*(?:ERROR|error|Error):?\s*([^\n]+))?/g;
+  let m: RegExpExecArray | null;
+  while ((m = esbuild.exec(log)) !== null) {
+    const path = m[1].replace(/^\/opt\/build\/repo\//, "");
+    const line = Number(m[2]);
+    const col = Number(m[3]);
+    const message = (m[4] ?? "").trim().slice(0, 240);
+    const key = `${path}:${line}:${col}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ path, line, col, message });
+  }
+  // tsc style: path/to/file.ts(12,5): error TSxxxx: message
+  const tsc = /((?:src|app|lib|pages|components|hooks|utils|server|routes)[^\s:()]*\.(?:tsx?|jsx?)):?\((\d+),(\d+)\):\s*error\s+TS\d+:\s*([^\n]+)/g;
+  while ((m = tsc.exec(log)) !== null) {
+    const key = `${m[1]}:${m[2]}:${m[3]}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ path: m[1], line: Number(m[2]), col: Number(m[3]), message: m[4].trim().slice(0, 240) });
+  }
+  return out.slice(0, 10);
 }
 
 // ---------------------------------------------------------------------------

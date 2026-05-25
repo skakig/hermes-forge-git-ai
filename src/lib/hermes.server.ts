@@ -398,63 +398,95 @@ function renderPlanMarkdown(loop: LoopRow): string {
   return lines.join("\n");
 }
 
-// Cheap syntactic sanity gate. We can't run the build inside the Worker,
-// but we can refuse to push files whose structure is obviously corrupted —
-// unbalanced braces, dangling parens, broken JSON. This prevents the most
-// common "deploy fails because the file no longer parses" cycle.
-function sanityCheck(path: string, contents: string): string | null {
-  if (!contents || contents.length < 2) return "file is empty or too short";
-  // Catch common AI-output artifacts that produce instant build failures.
-  // These run before language-specific checks so they apply to all file types.
-  if (/^\uFEFF?\s*```/.test(contents)) return "starts with a markdown code fence (```)";
-  if (/\n```\s*$/.test(contents)) return "ends with a trailing markdown code fence (```)";
-  if (/^\uFEFF?\s*(?:Here(?:'s| is)|Sure[,!]|Below is|I('?| ?'?ve| will)|Okay[,.])/i.test(contents)) {
-    return "starts with a chat-style preamble instead of code";
-  }
-  if (/\u0000/.test(contents)) return "contains null bytes";
-  if (/\uFFFD/.test(contents)) return "contains Unicode replacement characters (corrupt encoding)";
-  if (/\.json$/i.test(path)) {
-    try { JSON.parse(contents); return null; } catch (e) {
-      return `invalid JSON: ${e instanceof Error ? e.message : String(e)}`;
+// Unbypassable pre-commit validator. Returns a rule name + human message when
+// the file MUST NOT be pushed. Every putFile of agent-authored source MUST go
+// through this gate. We can't run the build inside the Worker, but we can
+// deterministically catch the AI-output failure modes that have actually
+// broken our deploys (stray ''' wrappers, markdown fences, chat preambles,
+// bracket-imbalance) — much more strictly than before.
+export type ValidationResult = { ok: true } | { ok: false; rule: string; message: string };
+
+function reject(rule: string, message: string): ValidationResult {
+  return { ok: false, rule, message };
+}
+
+export function validateProposedFile(path: string, contents: string): ValidationResult {
+  if (!contents || contents.length < 2) return reject("EMPTY_FILE", "file is empty or too short");
+
+  // Strip a leading BOM for comparison, keep original for line work.
+  const stripped = contents.replace(/^\uFEFF/, "");
+
+  // Universal AI-output artifacts. Apply to EVERY file type.
+  if (/^\s*```/.test(stripped)) return reject("LEADING_MARKDOWN_FENCE", "file starts with a ``` code fence");
+  if (/\n\s*```\s*$/.test(stripped)) return reject("TRAILING_MARKDOWN_FENCE", "file ends with a ``` code fence");
+  if (/^\s*'{3,}/.test(stripped)) return reject("LEADING_TRIPLE_QUOTE", "file starts with stray ''' characters");
+  if (/^\s*"{3,}/.test(stripped)) return reject("LEADING_TRIPLE_DQUOTE", "file starts with stray \"\"\" characters");
+
+  // Line-level scan: ANY line that consists solely of ''' / """ / ``` is
+  // a Python-docstring/markdown leakage and must be rejected — this is the
+  // exact pattern that broke Netlify (line 1 + last line of useGameState.ts).
+  const lines = stripped.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (t === "'''" || t === '"""' || t === "```") {
+      return reject(
+        "STRAY_TRIPLE_QUOTE_LINE",
+        `line ${i + 1} is a stray ${t} wrapper (Python docstring / markdown leakage)`,
+      );
     }
   }
+
+  // Trailing-only artifact: last non-blank line is a stray wrapper.
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const t = lines[i].trim();
+    if (!t) continue;
+    if (t === "'''" || t === '"""' || t === "```") {
+      return reject("TRAILING_TRIPLE_QUOTE", `last line is a stray ${t} wrapper`);
+    }
+    break;
+  }
+
+  if (/^\s*(?:Here(?:'s| is)|Sure[,!]|Below is|Certainly[,.]|Of course|I('?| ?'?ve| will| can))/i.test(stripped)) {
+    return reject("CHAT_PREAMBLE", "file starts with a chat-style preamble instead of code");
+  }
+  if (/\u0000/.test(contents)) return reject("NULL_BYTES", "contains null bytes");
+  if (/\uFFFD/.test(contents)) return reject("BAD_ENCODING", "contains Unicode replacement characters (corrupt encoding)");
+
+  if (/\.json$/i.test(path)) {
+    try { JSON.parse(contents); return { ok: true }; }
+    catch (e) { return reject("INVALID_JSON", `invalid JSON: ${e instanceof Error ? e.message : String(e)}`); }
+  }
+
   if (/\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(path)) {
-    // Triple quotes / leading garbage before the first real token — this is
-    // exactly the `'''import ...` failure mode that took down Netlify builds.
-    const head = contents.replace(/^\uFEFF/, "").slice(0, 200);
-    if (/^\s*'{3,}/.test(head)) return "file starts with stray quote characters (e.g. ''')";
-    if (/^\s*"{3,}/.test(head)) return "file starts with stray double-quote characters";
     // First non-comment, non-blank line must look like valid TS/JS.
-    const firstCode = contents
-      .split(/\r?\n/)
+    const firstCode = lines
       .map((l) => l.replace(/^\s+/, ""))
       .find((l) => l.length > 0 && !l.startsWith("//") && !l.startsWith("/*") && !l.startsWith("*"));
-    if (firstCode && !/^(import\b|export\b|const\b|let\b|var\b|function\b|class\b|type\b|interface\b|enum\b|declare\b|async\b|namespace\b|module\b|@|\/\*|\(|\{|"use |if\b|return\b)/.test(firstCode)) {
-      // Heuristic: a leading line that doesn't begin like JS is suspicious.
-      // Allow JSX returns / arrow IIFEs by checking for "<" too.
-      if (!/^[<;]/.test(firstCode)) {
-        return `first code line does not look like valid JS/TS: ${firstCode.slice(0, 60)}`;
+    if (firstCode) {
+      const ok = /^(import\b|export\b|const\b|let\b|var\b|function\b|class\b|type\b|interface\b|enum\b|declare\b|async\b|namespace\b|module\b|@|\/\*|\(|\{|"use |'use |if\b|return\b|<|;)/.test(firstCode);
+      if (!ok) {
+        return reject("FIRST_LINE_NOT_JS", `first code line does not look like valid JS/TS: ${firstCode.slice(0, 60)}`);
       }
     }
-    // Strip strings + comments cheaply, then check bracket balance.
-    const stripped = contents
+    // Cheap bracket-balance check after stripping strings + comments.
+    const cleaned = contents
       .replace(/\/\*[\s\S]*?\*\//g, "")
       .replace(/\/\/[^\n]*/g, "")
       .replace(/`(?:\\.|[^`\\])*`/g, "``")
       .replace(/"(?:\\.|[^"\\])*"/g, '""')
       .replace(/'(?:\\.|[^'\\])*'/g, "''");
     let curly = 0, paren = 0, square = 0;
-    for (const ch of stripped) {
+    for (const ch of cleaned) {
       if (ch === "{") curly++; else if (ch === "}") curly--;
       else if (ch === "(") paren++; else if (ch === ")") paren--;
       else if (ch === "[") square++; else if (ch === "]") square--;
-      if (curly < 0 || paren < 0 || square < 0) return "unmatched closing bracket";
+      if (curly < 0 || paren < 0 || square < 0) return reject("UNMATCHED_BRACKET", "unmatched closing bracket");
     }
-    if (curly !== 0) return `unbalanced braces (${curly > 0 ? "+" : ""}${curly})`;
-    if (paren !== 0) return `unbalanced parens (${paren > 0 ? "+" : ""}${paren})`;
-    if (square !== 0) return `unbalanced brackets (${square > 0 ? "+" : ""}${square})`;
+    if (curly !== 0) return reject("UNBALANCED_BRACES", `unbalanced braces (${curly > 0 ? "+" : ""}${curly})`);
+    if (paren !== 0) return reject("UNBALANCED_PARENS", `unbalanced parens (${paren > 0 ? "+" : ""}${paren})`);
+    if (square !== 0) return reject("UNBALANCED_BRACKETS", `unbalanced brackets (${square > 0 ? "+" : ""}${square})`);
   }
-  return null;
+  return { ok: true };
 }
 
 const PATCH_CONFIG_FILES = [

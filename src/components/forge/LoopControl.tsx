@@ -14,10 +14,11 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 
-const phaseOrder = ["audit", "plan", "draft_pr", "patch", "commit", "ready", "checks_pending", "completed"];
+const phaseOrder = ["audit", "plan", "research", "draft_pr", "patch", "commit", "ready", "checks_pending", "completed"];
 const phaseLabels: Record<string, string> = {
   audit: "Auditing source tree",
   plan: "Forming a plan",
+  research: "Researching authoritative rules",
   draft_pr: "Opening draft PR",
   patch: "Editing files",
   commit: "Pushing commits",
@@ -64,12 +65,21 @@ function CheckRunList({
   const planExtra = (loop.plan ?? {}) as {
     validation_notes?: string[];
     build_errors?: Array<{ path: string; line: number; col: number; message: string }>;
+    research?: {
+      queries?: string[];
+      sources?: Array<{ url: string; title: string; summary: string }>;
+      rules_extracted?: string;
+      augmented?: boolean;
+    };
   };
+  const research = planExtra.research;
+  const hasResearch = !!(research && (research.sources?.length || research.rules_extracted));
+  const mergedWithFailures = loop.checks_status === "merged_with_failures";
   const showDiagnosis = (loop.phase === "diagnose_failure" || loop.phase === "repair_patch" || loop.phase === "blocked")
     && (plan.hypothesis || plan.proposed_change);
   const hasValidationNotes = (planExtra.validation_notes?.length ?? 0) > 0;
   const hasBuildErrors = (planExtra.build_errors?.length ?? 0) > 0;
-  if (!loop.checks_status && checks.length === 0 && !loop.last_error && !showDiagnosis && !hasValidationNotes && !hasBuildErrors) return null;
+  if (!loop.checks_status && checks.length === 0 && !loop.last_error && !showDiagnosis && !hasValidationNotes && !hasBuildErrors && !hasResearch) return null;
   const attempts = loop.attempt_count ?? 0;
   const max = loop.max_attempts ?? 3;
   return (
@@ -125,6 +135,35 @@ function CheckRunList({
             ))}
           </ul>
         </details>
+      ) : null}
+      {hasResearch ? (
+        <details className="mt-3 group">
+          <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground select-none">
+            Research · {research!.sources?.length ?? 0} source{(research!.sources?.length ?? 0) === 1 ? "" : "s"}
+            {research!.augmented ? " · web-verified" : ""} — click to expand
+          </summary>
+          <div className="mt-2 grid gap-2 text-[11px] text-foreground/80">
+            {research!.rules_extracted ? (
+              <pre className="whitespace-pre-wrap break-words font-mono">{research!.rules_extracted}</pre>
+            ) : null}
+            {research!.sources?.length ? (
+              <ul className="grid gap-0.5">
+                {research!.sources!.map((s, i) => (
+                  <li key={i}>
+                    <a href={s.url} target="_blank" rel="noreferrer" className="text-primary hover:underline inline-flex items-center gap-1">
+                      {s.title} <ExternalLink className="size-3" />
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+        </details>
+      ) : null}
+      {mergedWithFailures ? (
+        <div className="mt-3 rounded border border-emerald-500/30 bg-emerald-500/5 p-2 text-xs text-emerald-200/90">
+          PR was merged despite failing checks. Loop is complete — review the merged commit.
+        </div>
       ) : null}
       {failureLogs.length > 0 ? (
         <details className="mt-3 group">

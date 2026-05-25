@@ -1,124 +1,66 @@
-## What’s going wrong
 
-The current agent did capture the Netlify failure, but the repair loop still has two major blind spots:
+## Goal
 
-1. **The soft check is too weak.** The current `sanityCheck` only checks bracket balance and JSON. It will not catch `'''import ...` because that is balanced text but invalid TypeScript.
-2. **The repair loop trusts the AI too much.** If the AI returns a corrupted file, Hermes skips only obvious structural issues. It does not run a real parser-style validation before pushing another commit.
-3. **Diagnosis should produce deterministic fixes when logs are explicit.** In this case the log clearly says `src/hooks/useGameState.ts:1:2` and shows `'''import`. Hermes should route this into a precise repair step instead of asking the AI to infer everything.
+Stop Hermes from ever committing corrupted source again, stop it from reporting `ERROR` on a PR that actually merged, and give it a research step so it can validate fixes against an authoritative external source (e.g. official Farkle rules) instead of guessing.
 
-## Best path forward
+## Problem recap (from the screenshots)
 
-Build a local validation/repair pipeline inside Hermes before it pushes commits, then use Netlify/GitHub checks as the outer feedback loop.
+1. PR #5 (`gameLogic.ts`) and commit `1d02eb4` (`useGameState.ts`) both still contain stray `'''` at line 1 and at EOF. My previous `sanityCheck` was supposed to reject these — clearly the gate is not actually running, or the AI's repair output is bypassing it.
+2. PR #5 got **merged** anyway (auto-merge or human), yet the Forge UI shows "Last loop ended in ERROR" — the loop's terminal state is derived only from CI checks, not from PR merge state.
+3. No mechanism exists for the agent to fetch external truth (game rules, API docs, RFCs) before changing behavior, so its "fix" is plausible-but-wrong.
 
-```text
-AI proposes edits
-  -> Hermes validates edited files locally with soft checks
-  -> if soft checks fail, Hermes asks AI to repair its own patch before committing
-  -> commit only validated edits
-  -> Netlify/GitHub runs full checks
-  -> if checks fail, Hermes parses logs, patches, validates again, and repeats
-  -> block only after max attempts with clear failure evidence
-```
+## What changes
 
-## Implementation plan
+### A. Make `sanityCheck` actually unbypassable (`src/lib/hermes.server.ts`)
 
-### 1. Replace the weak syntax gate with real soft checks
+Add a single `validateProposedFile(path, content)` that runs on **every** file write path — initial patch, repair patch, and the post-repair re-check — with no early returns:
 
-Add a stronger `validateFileContent` gate for files Hermes edits:
+- Hard reject when the first non-whitespace token of any `.ts/.tsx/.js/.jsx/.json/.md/.css` file is `'''`, ``` ``` ```, `"""`, or any line whose trimmed form equals one of those.
+- Hard reject when the **last** non-whitespace line is `'''`, ``` ``` ```, or `"""`.
+- Hard reject prose preambles (`Here is`, `Sure!`, `Below is`, `Certainly`).
+- For `.ts/.tsx/.js/.jsx`: run a real parser via the TypeScript compiler API (`ts.transpileModule` with `noEmit: true`) and reject on any syntax diagnostic. The current heuristic check is too weak — `'''` is a SyntaxError to a real parser, so this catches it deterministically.
+- Log every rejection into `plan.validation_notes` with file path, rule that fired, and a 200-char excerpt of the offending region.
 
-- For `.ts`, `.tsx`, `.js`, `.jsx`, use TypeScript’s parser via the `typescript` package already installed.
-- Reject files with parse diagnostics before calling `putFile`.
-- Add targeted corruption checks for common AI artifacts:
-  - leading `'''`, ``` fences, or Markdown wrappers
-  - files starting with `Here is...`
-  - duplicate code-fence remnants
-  - null bytes / replacement characters
-- Keep JSON validation for `.json`.
-- Add basic TOML/YAML heuristics for config files without adding heavy runtime dependencies.
+Then wire it so the commit path **cannot** call `putFile` without the validator returning `ok: true`. If repair also fails validation twice, transition the loop to `blocked` with a structured reason — never push the bad file.
 
-This would have caught `'''import { useEffect }...` before the commit ever reached Netlify.
+### B. Fix loop terminal-state detection (`src/lib/hermes.server.ts`)
 
-### 2. Add “repair the patch before commit”
+After CI failure, before flipping to `error`, re-query the PR:
+- If `pr.merged === true` or `pr.state === "closed"` with merge_commit, transition to `completed` (with a note that CI failed but human merged).
+- If `pr.state === "open"` and checks failed and attempts < max, continue to `repair_patch`.
+- Only set `error` / `blocked` when none of the above apply.
 
-If validation rejects an AI edit:
+Surface the distinction in `LoopControl.tsx`: the amber "Last loop ended in ERROR" banner becomes green "Merged with failing checks · review needed" when that path fires.
 
-- Do not silently skip and continue.
-- Feed Hermes the exact validation error plus the proposed broken file.
-- Ask for a corrected full-file output once.
-- Validate again.
-- Only commit if the corrected file passes.
-- If it still fails, move the loop to `blocked` with a clear reason instead of pushing broken code.
+### C. Add a `research` phase before `patch` (`src/lib/hermes.server.ts`)
 
-### 3. Parse explicit CI errors into repair targets
+New optional phase inserted between `plan` and `draft_pr` that runs only when the plan's `proposed_change` mentions domain rules (game logic, protocol, spec, algorithm). It:
 
-Enhance diagnosis so logs like this become deterministic repair context:
+1. Asks the AI to produce 1-3 web search queries grounding the fix (e.g. "official Farkle scoring rules hot dice").
+2. Calls the **Firecrawl** connector (`search` + `scrape` of the top 2 results in markdown).
+3. Stores the distilled rules under `plan.research = { queries, sources: [{url, title, summary}], rules_extracted }`.
+4. Includes `rules_extracted` verbatim in the system prompt for the patch step, so the AI patches **against** the documented rules instead of inventing behavior.
 
-```text
-/opt/build/repo/src/hooks/useGameState.ts:1:2: ERROR: Expected ";" but found "'import..."
-1 | '''import { useEffect } from 'react';
-```
+Requires the Firecrawl connector — I'll surface a one-time "Connect Firecrawl" prompt in the Forge ritual card if `FIRECRAWL_API_KEY` is not present, and fall back to skipping the phase when absent.
 
-Hermes should extract:
+### D. UI: research + validation panels (`src/components/forge/LoopControl.tsx`)
 
-- file: `src/hooks/useGameState.ts`
-- line: `1`
-- column: `2`
-- message: `Expected ";" but found...`
-- visible snippet: `'''import...`
+- New collapsible "Research" panel under the diagnosis card showing the queries Hermes ran and the cited source URLs.
+- The existing "Pre-commit validation" panel already exists; tighten it to show the rule name that fired (e.g. `LEADING_TRIPLE_QUOTE`, `TS_PARSE_ERROR`) so you can tell at a glance why a file was blocked.
 
-Then always include that file in `suspect_files`, even if the AI plan picked something else.
+## Files touched
 
-### 4. Make repair attempts build on the latest PR branch state
+- `src/lib/hermes.server.ts` — validator, terminal-state fix, research phase, prompt wiring
+- `src/components/forge/LoopControl.tsx` — research panel, merged-with-failing-checks state, tightened validation labels
+- (No DB migration — everything fits in existing `plan` / `checks_payload` JSON)
 
-Keep the existing behavior of reading from the PR branch, but tighten it:
+## Out of scope this round
 
-- Confirm suspect files exist on the PR branch.
-- Prefer files mentioned in CI logs over prior suspect files.
-- When the failure points to a Hermes-introduced syntax artifact, ask for a minimal revert/fix rather than another feature change.
+- Touching `src/utils/gameLogic.ts` / `src/hooks/useGameState.ts` in the target repo — once Hermes is hardened and has research, you re-ignite a loop with the bug report "Selecting non-scoring dice should Farkle per official rules" and let the agent do it correctly.
+- Auto-revert of the already-merged broken PR #5 in the target repo (manual revert in GitHub is faster).
 
-### 5. Add agent self-improvement memory in the PR
+## Acceptance
 
-Update `.hermes/plan.md` on every repair attempt with:
-
-- latest failing check summary
-- parsed root cause
-- files changed in the repair
-- validation results
-- attempt count
-
-This makes the PR explain what Hermes learned and how it improved the fix.
-
-### 6. Improve dashboard visibility
-
-In the loop UI, show a compact validation timeline:
-
-- `Patch generated`
-- `Soft checks failed: src/hooks/useGameState.ts:1:2 ...`
-- `Patch repaired`
-- `Soft checks passed`
-- `Pushed commit`
-
-That tells you whether the failure came from the repo itself or from Hermes producing invalid code.
-
-## Why this is the right approach
-
-Netlify should become the **outer truth source**, not the first validator. Hermes needs a cheap internal “preflight” layer before every commit so obvious syntax corruption is fixed immediately. Then the deployed checks handle deeper issues like missing packages, test failures, type errors, and runtime build configuration.
-
-## What this will not solve immediately
-
-This will not guarantee every PR passes on the first attempt. It will, however, prevent the worst class of failures: Hermes committing syntactically invalid files. For deeper failures, the loop will now have better evidence and a safer retry process.
-
-## Files to change
-
-- `src/lib/hermes.server.ts`
-  - stronger validation
-  - patch self-repair before commit
-  - CI log error extraction
-  - deterministic suspect-file override
-  - `.hermes/plan.md` repair notes
-- `src/lib/github-app.server.ts`
-  - optionally improve Netlify log extraction if needed
-- `src/components/forge/LoopControl.tsx`
-  - show validation/repair evidence in the UI
-
-No database migration is required if we store validation details in the existing `checks_payload` / `plan` JSON fields.
+- A loop that tries to write `'''import ...` is blocked at validation, attempts one repair, and either commits a clean file or transitions to `blocked` — no `'''` ever reaches GitHub.
+- A loop whose PR gets merged despite failing CI shows as `completed (merged with failing checks)`, not `ERROR`.
+- A loop targeting a game-logic bug shows a "Research" panel citing the official rules source URL, and the patch prompt contains the extracted rules.

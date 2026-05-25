@@ -13,6 +13,7 @@ import {
   markPRReadyForReview,
   listPRChecks,
   collectFailureLogs,
+  getPRState,
   type FailureLog,
   type RepoTreeEntry,
 } from "./github-app.server";
@@ -152,6 +153,8 @@ export async function runPhase(ctx: PhaseCtx): Promise<PhasePatch> {
       return runAudit(ctx, token);
     case "plan":
       return runPlan(ctx);
+    case "research":
+      return runResearch(ctx);
     case "draft_pr":
       return runDraftPr(ctx, token);
     case "patch":
@@ -262,7 +265,7 @@ async function runPlan(ctx: PhaseCtx): Promise<PhasePatch> {
   if (!planArgs) throw new Error("plan_missing_tool_call");
   const suspect = (planArgs.suspect_files ?? []).filter(Boolean).slice(0, 5);
   return {
-    phase: "draft_pr",
+    phase: "research",
     plan: {
       summary: ctx.loop.plan?.summary,
       hypothesis: planArgs.hypothesis,
@@ -274,6 +277,171 @@ async function runPlan(ctx: PhaseCtx): Promise<PhasePatch> {
     },
     suspect_files: suspect,
     message: `Plan ready · ${planArgs.hypothesis.slice(0, 90)}`,
+    comment_kind: "progress",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Research phase. The agent writes down the authoritative rules / spec /
+// algorithm it intends to implement BEFORE touching code. Two paths:
+//
+//   1. AI-only: ask the model to recall the canonical rules from its training
+//      data, with explicit source citations (URLs / RFCs / book titles).
+//   2. Firecrawl-augmented (when FIRECRAWL_API_KEY is set): use the AI's
+//      search queries, scrape the top results, and feed the markdown back in.
+//
+// The distilled rules become a `research` block on the plan and are injected
+// verbatim into the patch system prompt so the agent codes AGAINST the spec
+// rather than inventing behavior. Falls back to a no-op if AI fails.
+// ---------------------------------------------------------------------------
+
+type ResearchBlock = {
+  queries: string[];
+  sources: Array<{ url: string; title: string; summary: string }>;
+  rules_extracted: string;
+  augmented: boolean;
+};
+
+async function firecrawlSearchAndScrape(query: string): Promise<Array<{ url: string; title: string; markdown: string }>> {
+  const key = process.env.FIRECRAWL_API_KEY;
+  if (!key) return [];
+  try {
+    const res = await fetch("https://api.firecrawl.dev/v2/search", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query,
+        limit: 2,
+        scrapeOptions: { formats: ["markdown"], onlyMainContent: true },
+      }),
+    });
+    if (!res.ok) return [];
+    const json = (await res.json()) as {
+      data?: { web?: Array<{ url: string; title?: string; markdown?: string }> } | Array<{ url: string; title?: string; markdown?: string }>;
+    };
+    const raw = Array.isArray(json.data) ? json.data : json.data?.web ?? [];
+    return raw.slice(0, 2).map((r) => ({
+      url: r.url,
+      title: r.title ?? r.url,
+      markdown: (r.markdown ?? "").slice(0, 4000),
+    }));
+  } catch (e) {
+    console.error("firecrawl search failed:", e);
+    return [];
+  }
+}
+
+async function runResearch(ctx: PhaseCtx): Promise<PhasePatch> {
+  const { loop } = ctx;
+  const plan = loop.plan ?? {};
+  const bug = loop.bug_report?.trim() ?? "";
+  // Ask the AI to produce search queries + an authoritative rules brief from
+  // its own knowledge, with source citations. This is useful even without
+  // Firecrawl because well-known domains (game rules, RFCs, common algorithms)
+  // are in the model's training data.
+  let ai;
+  try {
+    ai = await callAI({
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are Hermes' research analyst. Before any code changes, you produce an AUTHORITATIVE rules brief for the proposed change so the engineer codes against the spec, not against guesses. " +
+            "If the proposed change touches a well-known domain (game rules, protocols, algorithms, accessibility specs, etc.), recall the canonical rules from your training and cite the most authoritative public source URL you know. " +
+            "Also produce 1-3 targeted web search queries someone could run to verify. If the change is purely internal refactor / typing with no external spec, return empty rules and one query.",
+        },
+        {
+          role: "user",
+          content: [
+            `Hypothesis: ${plan.hypothesis ?? "(none)"}`,
+            `Proposed change: ${plan.proposed_change ?? "(none)"}`,
+            bug ? `User bug report: ${bug}` : "",
+            `Repo brief: ${plan.summary ?? "(none)"}`,
+          ].filter(Boolean).join("\n"),
+        },
+      ],
+      tool: {
+        name: "submit_research",
+        description: "Submit a rules brief grounding the proposed change.",
+        parameters: {
+          type: "object",
+          properties: {
+            queries: {
+              type: "array",
+              items: { type: "string" },
+              description: "1-3 web search queries that would verify the rules.",
+            },
+            sources: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  url: { type: "string" },
+                  title: { type: "string" },
+                  summary: { type: "string", description: "One-paragraph summary of what this source says about the rules." },
+                },
+                required: ["url", "title", "summary"],
+                additionalProperties: false,
+              },
+              description: "Up to 3 authoritative source URLs from your training data.",
+            },
+            rules_extracted: {
+              type: "string",
+              description: "The actual rules / spec the engineer must implement, in numbered form. Be specific and conservative. If no external spec applies, write 'No external spec applies.'",
+            },
+          },
+          required: ["queries", "sources", "rules_extracted"],
+          additionalProperties: false,
+        },
+      },
+    });
+  } catch (e) {
+    console.error("research phase AI call failed:", e);
+    return {
+      phase: "draft_pr",
+      message: `Research skipped (${e instanceof Error ? e.message.slice(0, 80) : "AI error"})`,
+      comment_kind: "progress",
+    };
+  }
+  const r = ai.tool as { queries: string[]; sources: Array<{ url: string; title: string; summary: string }>; rules_extracted: string } | null;
+  if (!r) {
+    return { phase: "draft_pr", message: "Research returned no brief; proceeding", comment_kind: "progress" };
+  }
+
+  let augmented = false;
+  const sources = [...(r.sources ?? [])];
+  // Optional Firecrawl augmentation: actually fetch the top query's results
+  // and append a short summary so the patch step has fresh ground truth.
+  if (process.env.FIRECRAWL_API_KEY && (r.queries?.[0]?.length ?? 0) > 3) {
+    const hits = await firecrawlSearchAndScrape(r.queries[0]);
+    if (hits.length) {
+      augmented = true;
+      for (const h of hits) {
+        if (sources.some((s) => s.url === h.url)) continue;
+        sources.push({
+          url: h.url,
+          title: h.title,
+          summary: h.markdown.slice(0, 600).replace(/\s+/g, " ").trim(),
+        });
+      }
+    }
+  }
+
+  const research: ResearchBlock = {
+    queries: (r.queries ?? []).slice(0, 3),
+    sources: sources.slice(0, 5),
+    rules_extracted: r.rules_extracted ?? "",
+    augmented,
+  };
+
+  return {
+    phase: "draft_pr",
+    plan: {
+      ...(loop.plan ?? {}),
+      // @ts-expect-error stored alongside plan for the patch step + UI
+      research,
+    },
+    message: `Research ready · ${research.sources.length} source${research.sources.length === 1 ? "" : "s"}${augmented ? " (web-verified)" : ""}`,
     comment_kind: "progress",
   };
 }
@@ -397,63 +565,95 @@ function renderPlanMarkdown(loop: LoopRow): string {
   return lines.join("\n");
 }
 
-// Cheap syntactic sanity gate. We can't run the build inside the Worker,
-// but we can refuse to push files whose structure is obviously corrupted —
-// unbalanced braces, dangling parens, broken JSON. This prevents the most
-// common "deploy fails because the file no longer parses" cycle.
-function sanityCheck(path: string, contents: string): string | null {
-  if (!contents || contents.length < 2) return "file is empty or too short";
-  // Catch common AI-output artifacts that produce instant build failures.
-  // These run before language-specific checks so they apply to all file types.
-  if (/^\uFEFF?\s*```/.test(contents)) return "starts with a markdown code fence (```)";
-  if (/\n```\s*$/.test(contents)) return "ends with a trailing markdown code fence (```)";
-  if (/^\uFEFF?\s*(?:Here(?:'s| is)|Sure[,!]|Below is|I('?| ?'?ve| will)|Okay[,.])/i.test(contents)) {
-    return "starts with a chat-style preamble instead of code";
-  }
-  if (/\u0000/.test(contents)) return "contains null bytes";
-  if (/\uFFFD/.test(contents)) return "contains Unicode replacement characters (corrupt encoding)";
-  if (/\.json$/i.test(path)) {
-    try { JSON.parse(contents); return null; } catch (e) {
-      return `invalid JSON: ${e instanceof Error ? e.message : String(e)}`;
+// Unbypassable pre-commit validator. Returns a rule name + human message when
+// the file MUST NOT be pushed. Every putFile of agent-authored source MUST go
+// through this gate. We can't run the build inside the Worker, but we can
+// deterministically catch the AI-output failure modes that have actually
+// broken our deploys (stray ''' wrappers, markdown fences, chat preambles,
+// bracket-imbalance) — much more strictly than before.
+export type ValidationResult = { ok: true } | { ok: false; rule: string; message: string };
+
+function reject(rule: string, message: string): ValidationResult {
+  return { ok: false, rule, message };
+}
+
+export function validateProposedFile(path: string, contents: string): ValidationResult {
+  if (!contents || contents.length < 2) return reject("EMPTY_FILE", "file is empty or too short");
+
+  // Strip a leading BOM for comparison, keep original for line work.
+  const stripped = contents.replace(/^\uFEFF/, "");
+
+  // Universal AI-output artifacts. Apply to EVERY file type.
+  if (/^\s*```/.test(stripped)) return reject("LEADING_MARKDOWN_FENCE", "file starts with a ``` code fence");
+  if (/\n\s*```\s*$/.test(stripped)) return reject("TRAILING_MARKDOWN_FENCE", "file ends with a ``` code fence");
+  if (/^\s*'{3,}/.test(stripped)) return reject("LEADING_TRIPLE_QUOTE", "file starts with stray ''' characters");
+  if (/^\s*"{3,}/.test(stripped)) return reject("LEADING_TRIPLE_DQUOTE", "file starts with stray \"\"\" characters");
+
+  // Line-level scan: ANY line that consists solely of ''' / """ / ``` is
+  // a Python-docstring/markdown leakage and must be rejected — this is the
+  // exact pattern that broke Netlify (line 1 + last line of useGameState.ts).
+  const lines = stripped.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (t === "'''" || t === '"""' || t === "```") {
+      return reject(
+        "STRAY_TRIPLE_QUOTE_LINE",
+        `line ${i + 1} is a stray ${t} wrapper (Python docstring / markdown leakage)`,
+      );
     }
   }
+
+  // Trailing-only artifact: last non-blank line is a stray wrapper.
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const t = lines[i].trim();
+    if (!t) continue;
+    if (t === "'''" || t === '"""' || t === "```") {
+      return reject("TRAILING_TRIPLE_QUOTE", `last line is a stray ${t} wrapper`);
+    }
+    break;
+  }
+
+  if (/^\s*(?:Here(?:'s| is)|Sure[,!]|Below is|Certainly[,.]|Of course|I('?| ?'?ve| will| can))/i.test(stripped)) {
+    return reject("CHAT_PREAMBLE", "file starts with a chat-style preamble instead of code");
+  }
+  if (/\u0000/.test(contents)) return reject("NULL_BYTES", "contains null bytes");
+  if (/\uFFFD/.test(contents)) return reject("BAD_ENCODING", "contains Unicode replacement characters (corrupt encoding)");
+
+  if (/\.json$/i.test(path)) {
+    try { JSON.parse(contents); return { ok: true }; }
+    catch (e) { return reject("INVALID_JSON", `invalid JSON: ${e instanceof Error ? e.message : String(e)}`); }
+  }
+
   if (/\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(path)) {
-    // Triple quotes / leading garbage before the first real token — this is
-    // exactly the `'''import ...` failure mode that took down Netlify builds.
-    const head = contents.replace(/^\uFEFF/, "").slice(0, 200);
-    if (/^\s*'{3,}/.test(head)) return "file starts with stray quote characters (e.g. ''')";
-    if (/^\s*"{3,}/.test(head)) return "file starts with stray double-quote characters";
     // First non-comment, non-blank line must look like valid TS/JS.
-    const firstCode = contents
-      .split(/\r?\n/)
+    const firstCode = lines
       .map((l) => l.replace(/^\s+/, ""))
       .find((l) => l.length > 0 && !l.startsWith("//") && !l.startsWith("/*") && !l.startsWith("*"));
-    if (firstCode && !/^(import\b|export\b|const\b|let\b|var\b|function\b|class\b|type\b|interface\b|enum\b|declare\b|async\b|namespace\b|module\b|@|\/\*|\(|\{|"use |if\b|return\b)/.test(firstCode)) {
-      // Heuristic: a leading line that doesn't begin like JS is suspicious.
-      // Allow JSX returns / arrow IIFEs by checking for "<" too.
-      if (!/^[<;]/.test(firstCode)) {
-        return `first code line does not look like valid JS/TS: ${firstCode.slice(0, 60)}`;
+    if (firstCode) {
+      const ok = /^(import\b|export\b|const\b|let\b|var\b|function\b|class\b|type\b|interface\b|enum\b|declare\b|async\b|namespace\b|module\b|@|\/\*|\(|\{|"use |'use |if\b|return\b|<|;)/.test(firstCode);
+      if (!ok) {
+        return reject("FIRST_LINE_NOT_JS", `first code line does not look like valid JS/TS: ${firstCode.slice(0, 60)}`);
       }
     }
-    // Strip strings + comments cheaply, then check bracket balance.
-    const stripped = contents
+    // Cheap bracket-balance check after stripping strings + comments.
+    const cleaned = contents
       .replace(/\/\*[\s\S]*?\*\//g, "")
       .replace(/\/\/[^\n]*/g, "")
       .replace(/`(?:\\.|[^`\\])*`/g, "``")
       .replace(/"(?:\\.|[^"\\])*"/g, '""')
       .replace(/'(?:\\.|[^'\\])*'/g, "''");
     let curly = 0, paren = 0, square = 0;
-    for (const ch of stripped) {
+    for (const ch of cleaned) {
       if (ch === "{") curly++; else if (ch === "}") curly--;
       else if (ch === "(") paren++; else if (ch === ")") paren--;
       else if (ch === "[") square++; else if (ch === "]") square--;
-      if (curly < 0 || paren < 0 || square < 0) return "unmatched closing bracket";
+      if (curly < 0 || paren < 0 || square < 0) return reject("UNMATCHED_BRACKET", "unmatched closing bracket");
     }
-    if (curly !== 0) return `unbalanced braces (${curly > 0 ? "+" : ""}${curly})`;
-    if (paren !== 0) return `unbalanced parens (${paren > 0 ? "+" : ""}${paren})`;
-    if (square !== 0) return `unbalanced brackets (${square > 0 ? "+" : ""}${square})`;
+    if (curly !== 0) return reject("UNBALANCED_BRACES", `unbalanced braces (${curly > 0 ? "+" : ""}${curly})`);
+    if (paren !== 0) return reject("UNBALANCED_PARENS", `unbalanced parens (${paren > 0 ? "+" : ""}${paren})`);
+    if (square !== 0) return reject("UNBALANCED_BRACKETS", `unbalanced brackets (${square > 0 ? "+" : ""}${square})`);
   }
-  return null;
+  return { ok: true };
 }
 
 const PATCH_CONFIG_FILES = [
@@ -580,10 +780,18 @@ async function runPatch(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
     "Return a coherent set of edits via the apply_edits tool. Make the MINIMUM change needed. Preserve unrelated code, formatting, comments, imports, and types. " +
     "If a file does not need to change, omit it from the edits array. Never invent APIs. If the failure logs point at a config file or an import that doesn't exist, fix the import or revert the offending change rather than editing more code.";
 
+  // Inject the research rules brief (if the research phase produced one) so
+  // the engineer codes against the authoritative spec, not guesses.
+  const research = (loop.plan as { research?: ResearchBlock } | null)?.research;
+  const researchPrompt = research && research.rules_extracted && research.rules_extracted !== "No external spec applies."
+    ? `\n\nAUTHORITATIVE RULES (implement EXACTLY these; do not invent additional behavior):\n${research.rules_extracted}\n\nSources: ${research.sources.map((s) => s.url).join(", ")}`
+    : "";
+  const fullSystemMsg = systemMsg + researchPrompt;
+
   if (useBundle) {
     const ai = await callAI({
       messages: [
-        { role: "system", content: systemMsg },
+        { role: "system", content: fullSystemMsg },
         {
           role: "user",
           content: [
@@ -635,7 +843,7 @@ async function runPatch(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
     for (const f of loaded) {
       const ai = await callAI({
         messages: [
-          { role: "system", content: systemMsg },
+          { role: "system", content: fullSystemMsg },
           {
             role: "user",
             content: [
@@ -684,27 +892,27 @@ async function runPatch(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
     if (!src) { skipped.push(`${e.path}: not in scope`); continue; }
     if (!e.changed || e.new_contents === src.content) continue;
     let toWrite = e.new_contents;
-    let reason = sanityCheck(e.path, toWrite);
-    if (reason) {
-      validationNotes.push(`${e.path}: rejected (${reason}); attempting one-shot repair…`);
+    let v = validateProposedFile(e.path, toWrite);
+    if (!v.ok) {
+      validationNotes.push(`${e.path}: rejected [${v.rule}] ${v.message}; attempting one-shot repair…`);
       try {
         const repairedContents = await repairProposedFile({
           path: e.path,
           rejectedContents: toWrite,
-          reason,
+          reason: `[${v.rule}] ${v.message}`,
           originalContents: src.content,
           hypothesis: loop.plan?.hypothesis ?? "",
           proposedChange: loop.plan?.proposed_change ?? "",
         });
         if (repairedContents) {
-          const reason2 = sanityCheck(e.path, repairedContents);
-          if (!reason2) {
+          const v2 = validateProposedFile(e.path, repairedContents);
+          if (v2.ok) {
             toWrite = repairedContents;
-            reason = null;
+            v = { ok: true };
             repaired.push(e.path);
             validationNotes.push(`${e.path}: repair passed validation`);
           } else {
-            validationNotes.push(`${e.path}: repair still invalid (${reason2})`);
+            validationNotes.push(`${e.path}: repair still invalid [${v2.rule}] ${v2.message}`);
           }
         } else {
           validationNotes.push(`${e.path}: repair returned no contents`);
@@ -713,7 +921,15 @@ async function runPatch(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
         validationNotes.push(`${e.path}: repair errored (${err instanceof Error ? err.message : String(err)})`);
       }
     }
-    if (reason) { skipped.push(`${e.path}: ${reason}`); continue; }
+    if (!v.ok) { skipped.push(`${e.path}: [${v.rule}] ${v.message}`); continue; }
+    // Belt-and-braces: re-validate immediately before pushing. Repair is the
+    // only path that could change toWrite after the first check, but if a
+    // future refactor adds another mutation we still cannot push junk.
+    const finalCheck = validateProposedFile(e.path, toWrite);
+    if (!finalCheck.ok) {
+      skipped.push(`${e.path}: final-check [${finalCheck.rule}] ${finalCheck.message}`);
+      continue;
+    }
     try {
       await putFile(token, repo.owner, repo.name, {
         path: e.path,
@@ -937,6 +1153,26 @@ async function runChecksPending(ctx: PhaseCtx, token: string): Promise<PhasePatc
   if (failed.length > 0) {
     const attempts = ctx.loop.attempt_count ?? 0;
     const max = ctx.loop.max_attempts ?? 3;
+    // Reconciliation: before we declare failure, ask GitHub whether the PR
+    // was actually merged anyway (auto-merge or human merge despite failing
+    // checks). If so, the loop is effectively complete and should NOT show
+    // as ERROR in the dashboard.
+    try {
+      const prState = await getPRState(token, repo.owner, repo.name, loop.pr_number);
+      if (prState.merged) {
+        return {
+          status: "completed",
+          phase: "completed",
+          checks_status: "merged_with_failures",
+          checks_payload: payload,
+          finished_at: new Date().toISOString(),
+          message: `PR #${loop.pr_number} was merged despite ${failed.length} failing check${failed.length === 1 ? "" : "s"} · review recommended`,
+          comment_kind: "completed",
+        };
+      }
+    } catch (e) {
+      console.error("getPRState failed during checks reconciliation:", e);
+    }
     if (attempts >= max) {
       return {
         status: "failed",

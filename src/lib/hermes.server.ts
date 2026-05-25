@@ -397,6 +397,51 @@ function renderPlanMarkdown(loop: LoopRow): string {
   return lines.join("\n");
 }
 
+// Cheap syntactic sanity gate. We can't run the build inside the Worker,
+// but we can refuse to push files whose structure is obviously corrupted —
+// unbalanced braces, dangling parens, broken JSON. This prevents the most
+// common "deploy fails because the file no longer parses" cycle.
+function sanityCheck(path: string, contents: string): string | null {
+  if (!contents || contents.length < 2) return "file is empty or too short";
+  if (/\.json$/i.test(path)) {
+    try { JSON.parse(contents); return null; } catch (e) {
+      return `invalid JSON: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  }
+  if (/\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(path)) {
+    // Strip strings + comments cheaply, then check bracket balance.
+    const stripped = contents
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\/\/[^\n]*/g, "")
+      .replace(/`(?:\\.|[^`\\])*`/g, "``")
+      .replace(/"(?:\\.|[^"\\])*"/g, '""')
+      .replace(/'(?:\\.|[^'\\])*'/g, "''");
+    let curly = 0, paren = 0, square = 0;
+    for (const ch of stripped) {
+      if (ch === "{") curly++; else if (ch === "}") curly--;
+      else if (ch === "(") paren++; else if (ch === ")") paren--;
+      else if (ch === "[") square++; else if (ch === "]") square--;
+      if (curly < 0 || paren < 0 || square < 0) return "unmatched closing bracket";
+    }
+    if (curly !== 0) return `unbalanced braces (${curly > 0 ? "+" : ""}${curly})`;
+    if (paren !== 0) return `unbalanced parens (${paren > 0 ? "+" : ""}${paren})`;
+    if (square !== 0) return `unbalanced brackets (${square > 0 ? "+" : ""}${square})`;
+  }
+  return null;
+}
+
+const PATCH_CONFIG_FILES = [
+  "package.json",
+  "tsconfig.json",
+  "vite.config.ts",
+  "vite.config.js",
+  "netlify.toml",
+  "next.config.js",
+  "tailwind.config.ts",
+];
+
+const MAX_BUNDLE_CHARS = 40_000;
+
 async function runPatch(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
   const { repo, loop } = ctx;
   if (!loop.branch) throw new Error("patch_missing_branch");
@@ -405,35 +450,121 @@ async function runPatch(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
     return { phase: "commit", message: "No suspect files identified; skipping patch.", comment_kind: "progress" };
   }
 
-  let edits = 0;
+  // Pull current contents from the PR branch (so repair sees prior edits).
+  type Loaded = { path: string; sha: string; content: string };
+  const loaded: Loaded[] = [];
   const errors: string[] = [];
   for (const path of files) {
     try {
       const existing = await getFileContents(token, repo.owner, repo.name, path, loop.branch);
-      if (!existing) {
-        errors.push(`${path}: file not found on branch`);
-        continue;
-      }
+      if (!existing) { errors.push(`${path}: not found on branch`); continue; }
+      loaded.push({ path, sha: existing.sha, content: existing.content });
+    } catch (e) {
+      errors.push(`${path}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  if (loaded.length === 0) {
+    return { phase: "commit", message: `No files could be loaded for patching (${errors.length} error${errors.length === 1 ? "" : "s"})`, comment_kind: "progress" };
+  }
+
+  // Failure-log context (only present on repair attempts).
+  const ckPayload = (loop.checks_payload ?? {}) as { failure_logs?: FailureLog[] };
+  const failureLogs = ckPayload.failure_logs ?? [];
+  const failureDigest = failureLogs.length
+    ? failureLogs.map((f) => `### ${f.name}\n${f.log || "(no log)"}`).join("\n\n").slice(0, 8000)
+    : "";
+
+  // Pull a couple of build-config files for context (read-only signal).
+  const configBlocks: string[] = [];
+  for (const p of PATCH_CONFIG_FILES) {
+    try {
+      const got = await getFileContents(token, repo.owner, repo.name, p, loop.branch);
+      if (got?.content) configBlocks.push(`### ${p}\n\`\`\`\n${got.content.slice(0, 3000)}\n\`\`\``);
+    } catch { /* missing files are expected */ }
+  }
+
+  // Bundle files into a single AI call when they fit; fall back per-file otherwise.
+  const totalChars = loaded.reduce((n, f) => n + f.content.length, 0);
+  const useBundle = totalChars <= MAX_BUNDLE_CHARS;
+
+  type Edit = { path: string; new_contents: string; changed: boolean; note: string };
+  let proposed: Edit[] = [];
+
+  const systemMsg =
+    "You are Hermes, an autonomous code engineer. You will receive several source files plus a plan and (when present) the build/CI failure logs. " +
+    "Return a coherent set of edits via the apply_edits tool. Make the MINIMUM change needed. Preserve unrelated code, formatting, comments, imports, and types. " +
+    "If a file does not need to change, omit it from the edits array. Never invent APIs. If the failure logs point at a config file or an import that doesn't exist, fix the import or revert the offending change rather than editing more code.";
+
+  if (useBundle) {
+    const ai = await callAI({
+      messages: [
+        { role: "system", content: systemMsg },
+        {
+          role: "user",
+          content: [
+            `Repo: ${repo.full_name}`,
+            `Branch: ${loop.branch}`,
+            ``,
+            `Plan hypothesis: ${loop.plan?.hypothesis ?? ""}`,
+            `Proposed change: ${loop.plan?.proposed_change ?? ""}`,
+            loop.bug_report ? `User bug report: ${loop.bug_report}` : "",
+            failureDigest ? `\nCI / DEPLOY FAILURE LOGS (most recent attempt):\n${failureDigest}` : "",
+            configBlocks.length ? `\nBUILD CONFIG (read-only context):\n${configBlocks.join("\n\n")}` : "",
+            ``,
+            `FILES IN SCOPE:`,
+            ...loaded.map((f) => `\n### ${f.path}\n\`\`\`\n${f.content}\n\`\`\``),
+          ].filter(Boolean).join("\n"),
+        },
+      ],
+      tool: {
+        name: "apply_edits",
+        description: "Return the full new contents for each file you want to change.",
+        parameters: {
+          type: "object",
+          properties: {
+            edits: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  path: { type: "string" },
+                  new_contents: { type: "string", description: "Complete new file contents." },
+                  changed: { type: "boolean" },
+                  note: { type: "string", description: "One-line explanation." },
+                },
+                required: ["path", "new_contents", "changed", "note"],
+                additionalProperties: false,
+              },
+            },
+            summary: { type: "string", description: "Two-sentence summary of the overall change." },
+          },
+          required: ["edits", "summary"],
+          additionalProperties: false,
+        },
+      },
+    });
+    const args = ai.tool as { edits?: Edit[]; summary?: string } | null;
+    proposed = (args?.edits ?? []).filter((e) => e && e.path && typeof e.new_contents === "string");
+  } else {
+    // Files too big — fall back to per-file mode (legacy path).
+    for (const f of loaded) {
       const ai = await callAI({
         messages: [
-          {
-            role: "system",
-            content:
-              "You are Hermes, an autonomous code engineer. You will be given a single source file plus the improvement plan. Return the FULL new contents of the file via the apply_edit tool. Make the minimum change required by the plan. Do not change unrelated code, comments, or formatting. If the file does not need to change for this plan, return the file unchanged.",
-          },
+          { role: "system", content: systemMsg },
           {
             role: "user",
             content: [
               `Repo: ${repo.full_name}`,
-              `Path: ${path}`,
+              `Path: ${f.path}`,
               ``,
               `Plan hypothesis: ${loop.plan?.hypothesis ?? ""}`,
               `Proposed change: ${loop.plan?.proposed_change ?? ""}`,
               loop.bug_report ? `User bug report: ${loop.bug_report}` : "",
+              failureDigest ? `\nCI FAILURE LOGS:\n${failureDigest}` : "",
               ``,
               `CURRENT FILE CONTENTS:`,
               "```",
-              existing.content,
+              f.content,
               "```",
             ].filter(Boolean).join("\n"),
           },
@@ -444,40 +575,50 @@ async function runPatch(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
           parameters: {
             type: "object",
             properties: {
-              new_contents: { type: "string", description: "Complete new file contents." },
-              changed: { type: "boolean", description: "True if you actually changed the file." },
-              note: { type: "string", description: "Short note on what you changed (or why not)." },
+              new_contents: { type: "string" },
+              changed: { type: "boolean" },
+              note: { type: "string" },
             },
             required: ["new_contents", "changed", "note"],
             additionalProperties: false,
           },
         },
       });
-      const args = ai.tool as { new_contents: string; changed: boolean; note: string } | null;
-      if (!args) {
-        errors.push(`${path}: model did not return an edit`);
-        continue;
-      }
-      if (!args.changed || args.new_contents === existing.content) continue;
-      await putFile(token, repo.owner, repo.name, {
-        path,
-        content: args.new_contents,
-        branch: loop.branch,
-        message: `forge: ${args.note.slice(0, 60)}`,
-        sha: existing.sha,
-      });
-      edits++;
-    } catch (e) {
-      errors.push(`${path}: ${e instanceof Error ? e.message : String(e)}`);
+      const a = ai.tool as { new_contents: string; changed: boolean; note: string } | null;
+      if (a) proposed.push({ path: f.path, ...a });
     }
   }
 
-  const msg = edits === 0
-    ? "No file edits were applied" + (errors.length ? ` (${errors.length} issue${errors.length === 1 ? "" : "s"})` : "")
-    : `Patched ${edits} file${edits === 1 ? "" : "s"}`;
+  // Apply edits: sanity-check first, then write only files that pass.
+  let edits = 0;
+  const skipped: string[] = [];
+  for (const e of proposed) {
+    const src = loaded.find((l) => l.path === e.path);
+    if (!src) { skipped.push(`${e.path}: not in scope`); continue; }
+    if (!e.changed || e.new_contents === src.content) continue;
+    const reason = sanityCheck(e.path, e.new_contents);
+    if (reason) { skipped.push(`${e.path}: ${reason}`); continue; }
+    try {
+      await putFile(token, repo.owner, repo.name, {
+        path: e.path,
+        content: e.new_contents,
+        branch: loop.branch,
+        message: `forge: ${(e.note || "automated edit").slice(0, 60)}`,
+        sha: src.sha,
+      });
+      edits++;
+    } catch (err) {
+      skipped.push(`${e.path}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  const parts: string[] = [];
+  parts.push(edits === 0 ? "No file edits were applied" : `Patched ${edits} file${edits === 1 ? "" : "s"}`);
+  if (skipped.length) parts.push(`${skipped.length} skipped: ${skipped.slice(0, 3).join("; ")}`);
+  if (errors.length) parts.push(`${errors.length} load error${errors.length === 1 ? "" : "s"}`);
   return {
     phase: "commit",
-    message: msg,
+    message: parts.join(" · "),
     comment_kind: "progress",
   };
 }

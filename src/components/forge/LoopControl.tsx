@@ -32,6 +32,7 @@ const phaseLabels: Record<string, string> = {
 };
 
 type CheckItem = { name: string; state: string; url: string | null; summary: string | null };
+type FailureLog = { name: string; kind: "check_run" | "status"; url: string | null; log: string };
 
 function checkTone(state: string): string {
   if (["success", "completed"].includes(state)) return "text-emerald-400";
@@ -49,11 +50,20 @@ function CheckRunList({
     checks_status?: string | null;
     checks_payload?: unknown;
     last_error?: string | null;
+    plan?: unknown;
+    phase?: string | null;
   };
 }) {
-  const payload = (loop.checks_payload ?? {}) as { checks?: CheckItem[] };
+  const payload = (loop.checks_payload ?? {}) as {
+    checks?: CheckItem[];
+    failure_logs?: FailureLog[];
+  };
   const checks = payload.checks ?? [];
-  if (!loop.checks_status && checks.length === 0 && !loop.last_error) return null;
+  const failureLogs = payload.failure_logs ?? [];
+  const plan = (loop.plan ?? {}) as { hypothesis?: string; proposed_change?: string };
+  const showDiagnosis = (loop.phase === "diagnose_failure" || loop.phase === "repair_patch" || loop.phase === "blocked")
+    && (plan.hypothesis || plan.proposed_change);
+  if (!loop.checks_status && checks.length === 0 && !loop.last_error && !showDiagnosis) return null;
   const attempts = loop.attempt_count ?? 0;
   const max = loop.max_attempts ?? 3;
   return (
@@ -78,6 +88,39 @@ function CheckRunList({
             </li>
           ))}
         </ul>
+      ) : null}
+      {showDiagnosis ? (
+        <div className="mt-3 rounded border border-amber-500/30 bg-amber-500/5 p-2">
+          <div className="text-[10px] uppercase tracking-wider text-amber-300/80 mb-1">Hermes diagnosis</div>
+          {plan.hypothesis ? <div className="text-xs text-amber-100/90">{plan.hypothesis}</div> : null}
+          {plan.proposed_change ? (
+            <div className="mt-1 text-xs text-amber-100/70"><span className="text-amber-300/80">Fix:</span> {plan.proposed_change}</div>
+          ) : null}
+        </div>
+      ) : null}
+      {failureLogs.length > 0 ? (
+        <details className="mt-3 group">
+          <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground select-none">
+            Failure logs ({failureLogs.length}) — click to expand
+          </summary>
+          <div className="mt-2 grid gap-2">
+            {failureLogs.map((f, i) => (
+              <div key={`${f.name}-${i}`} className="rounded border border-border/60 bg-background/60 p-2">
+                <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1 flex items-center justify-between gap-2">
+                  <span>{f.name}</span>
+                  {f.url ? (
+                    <a href={f.url} target="_blank" rel="noreferrer" className="text-primary inline-flex items-center gap-1 hover:underline">
+                      open <ExternalLink className="size-3" />
+                    </a>
+                  ) : null}
+                </div>
+                <pre className="text-[11px] leading-snug font-mono text-foreground/80 whitespace-pre-wrap break-words max-h-56 overflow-auto">
+                  {f.log || "(no log captured)"}
+                </pre>
+              </div>
+            ))}
+          </div>
+        </details>
       ) : null}
       {loop.last_error ? (
         <div className="mt-2 text-xs text-red-300/90 font-mono whitespace-pre-wrap break-words">

@@ -806,12 +806,14 @@ export async function advanceLoopOnce(loopId: string): Promise<{
       installationId: Number((install as { installation_id: number | string }).installation_id),
     });
     const { message, comment_kind, ...dbPatch } = patch;
-    const releasePatch: Record<string, unknown> = { ...dbPatch, phase_running: false };
     // If the patch didn't set next_run_at, advancing the phase should make the
     // loop immediately due so the next worker tick picks it up.
-    if (releasePatch.next_run_at === undefined && releasePatch.phase) {
-      releasePatch.next_run_at = new Date().toISOString();
-    }
+    const next_run_at = dbPatch.next_run_at !== undefined
+      ? dbPatch.next_run_at
+      : dbPatch.phase
+      ? new Date().toISOString()
+      : null;
+    const releasePatch = { ...dbPatch, phase_running: false, next_run_at };
     const { data: updated } = await supabaseAdmin
       .from("loops")
       .update(releasePatch)

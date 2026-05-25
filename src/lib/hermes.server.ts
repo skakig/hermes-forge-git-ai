@@ -831,24 +831,45 @@ async function runChecksPending(ctx: PhaseCtx, token: string): Promise<PhasePatc
   };
 }
 
-async function runDiagnoseFailure(ctx: PhaseCtx): Promise<PhasePatch> {
-  const { loop } = ctx;
+async function runDiagnoseFailure(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
+  const { loop, repo } = ctx;
   const payload = (loop.checks_payload ?? {}) as {
     checks?: Array<{ name: string; state: string; url: string | null; summary: string | null }>;
+    failure_logs?: FailureLog[];
   };
   const failed = (payload.checks ?? []).filter((c) =>
     ["failure", "error", "timed_out", "action_required", "cancelled"].includes(c.state),
   );
-  const failureDigest = failed
-    .map((f) => `- ${f.name} (${f.state})${f.summary ? `: ${f.summary.slice(0, 240)}` : ""}`)
-    .join("\n");
+  const failureLogs = payload.failure_logs ?? [];
+  const logDigest = failureLogs.length
+    ? failureLogs.map((f) => `### ${f.name}\n${f.log || "(no log)"}`).join("\n\n").slice(0, 8000)
+    : failed.map((f) => `- ${f.name} (${f.state})${f.summary ? `: ${f.summary.slice(0, 240)}` : ""}`).join("\n");
+
+  // Read the files we touched last attempt + key build configs so the
+  // model can reason about WHY the change broke the build.
+  const fileBlocks: string[] = [];
+  if (loop.branch) {
+    const prevFiles = (loop.suspect_files ?? []).slice(0, 5);
+    for (const p of prevFiles) {
+      try {
+        const got = await getFileContents(token, repo.owner, repo.name, p, loop.branch);
+        if (got?.content) fileBlocks.push(`### ${p}\n\`\`\`\n${got.content.slice(0, 6000)}\n\`\`\``);
+      } catch { /* file may have been deleted */ }
+    }
+    for (const p of PATCH_CONFIG_FILES) {
+      try {
+        const got = await getFileContents(token, repo.owner, repo.name, p, loop.branch);
+        if (got?.content) fileBlocks.push(`### ${p}\n\`\`\`\n${got.content.slice(0, 2500)}\n\`\`\``);
+      } catch { /* not present */ }
+    }
+  }
 
   const ai = await callAI({
     messages: [
       {
         role: "system",
         content:
-          "You are Hermes. A PR you opened has failing CI/deploy checks. Given the previous plan and the failure summaries, propose a corrective patch focused ONLY on the failing checks. Identify up to 5 likely files to modify (repo-relative paths). Be specific and conservative — fix the failure, do not refactor.",
+          "You are Hermes. A PR you opened has failing CI/deploy checks. Read the failure logs and the current file contents on the PR branch, then propose a corrective plan focused ONLY on fixing those checks. Identify up to 5 likely files to modify (repo-relative paths). Be specific and conservative — fix the failure, do not refactor. If the root cause is the prior edit itself, the right fix may be to revert specific lines.",
       },
       {
         role: "user",
@@ -857,7 +878,8 @@ async function runDiagnoseFailure(ctx: PhaseCtx): Promise<PhasePatch> {
           `Original proposed change: ${loop.plan?.proposed_change ?? "(none)"}`,
           `Previously touched files:\n${(loop.suspect_files ?? []).map((f) => `- ${f}`).join("\n") || "(none)"}`,
           ``,
-          `Failing checks:\n${failureDigest || "(no detail available)"}`,
+          `FAILING CHECKS / BUILD LOGS:\n${logDigest || "(no detail available)"}`,
+          fileBlocks.length ? `\nCURRENT FILES ON BRANCH:\n${fileBlocks.join("\n\n")}` : "",
         ].join("\n"),
       },
     ],
@@ -867,7 +889,7 @@ async function runDiagnoseFailure(ctx: PhaseCtx): Promise<PhasePatch> {
       parameters: {
         type: "object",
         properties: {
-          diagnosis: { type: "string", description: "1-3 sentence root cause." },
+          diagnosis: { type: "string", description: "1-3 sentence root cause, citing the failing check and the offending line/file when possible." },
           suspect_files: {
             type: "array",
             items: { type: "string" },

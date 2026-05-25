@@ -129,7 +129,7 @@ export type PhasePatch = {
   attempt_count?: number;
   last_error?: string | null;
   checks_status?: string | null;
-  checks_payload?: Record<string, unknown>;
+  checks_payload?: import("@/integrations/supabase/types").Json;
   next_run_at?: string | null;
   message: string;
   comment_kind?: "progress" | "pr_opened" | "completed" | "error";

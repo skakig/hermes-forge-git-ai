@@ -1,79 +1,124 @@
+## What’s going wrong
 
-## Why every PR fails right now
+The current agent did capture the Netlify failure, but the repair loop still has two major blind spots:
 
-Your screenshot shows the dice repo PR has 4 failed Netlify checks (`Deploy Preview failed`, `Pages changed`, `Header rules`, `Redirect rules`). The Hermes agent did everything correctly *except* the part that matters: it opened a PR with code Netlify can't build.
+1. **The soft check is too weak.** The current `sanityCheck` only checks bracket balance and JSON. It will not catch `'''import ...` because that is balanced text but invalid TypeScript.
+2. **The repair loop trusts the AI too much.** If the AI returns a corrupted file, Hermes skips only obvious structural issues. It does not run a real parser-style validation before pushing another commit.
+3. **Diagnosis should produce deterministic fixes when logs are explicit.** In this case the log clearly says `src/hooks/useGameState.ts:1:2` and shows `'''import`. Hermes should route this into a precise repair step instead of asking the AI to infer everything.
 
-Looking at `hermes.server.ts` + `github-app.server.ts`, the real problems are:
+## Best path forward
 
-1. **Hermes can't see why checks failed.** `listPRChecks` only captures check `name` + a one-line `summary`. The diagnose step gets fed `"netlify/farklerocks/deploy-preview: Deploy Preview failed."` — there's no build log, no stack trace, no annotation. The AI is guessing blindfolded, so the "repair" patch is random.
-2. **The patcher edits files in isolation.** `runPatch` loops file-by-file, sending each file alone to the AI with no awareness of imports, types, or sibling files. The model invents APIs that don't exist, breaks types, or removes exports something else depends on.
-3. **The planner picks "suspect files" without reading them.** `runPlan` chooses up to 5 paths from a one-paragraph repo brief, never opens them, then commands edits. Often the wrong files.
-4. **No pre-flight check before pushing.** Hermes commits → Netlify builds → fails. There's no "does this even parse" gate.
+Build a local validation/repair pipeline inside Hermes before it pushes commits, then use Netlify/GitHub checks as the outer feedback loop.
 
-So you're not doing anything wrong — the agent is shipping unvalidated guesses. Here's the path forward.
+```text
+AI proposes edits
+  -> Hermes validates edited files locally with soft checks
+  -> if soft checks fail, Hermes asks AI to repair its own patch before committing
+  -> commit only validated edits
+  -> Netlify/GitHub runs full checks
+  -> if checks fail, Hermes parses logs, patches, validates again, and repeats
+  -> block only after max attempts with clear failure evidence
+```
 
-## Plan
+## Implementation plan
 
-### 1. Capture real failure evidence (highest impact)
+### 1. Replace the weak syntax gate with real soft checks
 
-Extend `listPRChecks` in `github-app.server.ts` to pull richer data per failing check:
+Add a stronger `validateFileContent` gate for files Hermes edits:
 
-- **GitHub check-runs**: also fetch `output.text` (full log body, up to 64KB) and `/check-runs/{id}/annotations` (file + line + message). This is what Lovable's own build checks return — should give us actionable info immediately.
-- **External statuses (Netlify)**: for each failing status, fetch the `target_url` HTML and extract the deploy-log snippet, OR (better) if user adds a `NETLIFY_AUTH_TOKEN` secret, hit `https://api.netlify.com/api/v1/deploys/{id}/log` for the structured build log. Detect the deploy ID from the `target_url` pattern.
-- Store the trimmed log (last ~6KB per failed check, tail-biased — errors are at the bottom) into `checks_payload.failure_logs`.
+- For `.ts`, `.tsx`, `.js`, `.jsx`, use TypeScript’s parser via the `typescript` package already installed.
+- Reject files with parse diagnostics before calling `putFile`.
+- Add targeted corruption checks for common AI artifacts:
+  - leading `'''`, ``` fences, or Markdown wrappers
+  - files starting with `Here is...`
+  - duplicate code-fence remnants
+  - null bytes / replacement characters
+- Keep JSON validation for `.json`.
+- Add basic TOML/YAML heuristics for config files without adding heavy runtime dependencies.
 
-### 2. Make `runDiagnoseFailure` actually diagnose
+This would have caught `'''import { useEffect }...` before the commit ever reached Netlify.
 
-Today it sees check names. Change it to:
+### 2. Add “repair the patch before commit”
 
-- Include the **failure log excerpts** from step 1 in the prompt.
-- **Read the current contents** of `suspect_files` from the PR branch AND `package.json`, `vite.config.*`, `netlify.toml`, `tsconfig.json`. Send them as context.
-- Ask for a **structured patch** (path + full new contents per file) in a single tool call, not just a "diagnosis + file list" that then triggers another isolated patch round.
+If validation rejects an AI edit:
 
-### 3. Coherent multi-file patching in one shot
+- Do not silently skip and continue.
+- Feed Hermes the exact validation error plus the proposed broken file.
+- Ask for a corrected full-file output once.
+- Validate again.
+- Only commit if the corrected file passes.
+- If it still fails, move the loop to `blocked` with a clear reason instead of pushing broken code.
 
-Replace the current per-file loop in `runPatch` with a single AI call that:
+### 3. Parse explicit CI errors into repair targets
 
-- Receives **all** suspect files + their current contents together (cap total at ~40KB).
-- Returns an array of `{ path, new_contents, changed, note }` so cross-file changes stay consistent.
-- Falls back to per-file mode only if the bundle exceeds the size cap.
+Enhance diagnosis so logs like this become deterministic repair context:
 
-### 4. Cheap pre-flight before committing
+```text
+/opt/build/repo/src/hooks/useGameState.ts:1:2: ERROR: Expected ";" but found "'import..."
+1 | '''import { useEffect } from 'react';
+```
 
-Before `putFile` writes each edit, run a minimum sanity gate:
+Hermes should extract:
 
-- **Syntax parse** for `.ts/.tsx/.js/.jsx` files (use TypeScript's `ts.createSourceFile` parser — runs fine on Workers, no FS needed). If a file doesn't parse, drop that edit and log it instead of pushing broken code.
-- For `.json`, run `JSON.parse`. For `.toml`, basic bracket-balance check.
+- file: `src/hooks/useGameState.ts`
+- line: `1`
+- column: `2`
+- message: `Expected ";" but found...`
+- visible snippet: `'''import...`
 
-This alone will eliminate most "deploy failed because the build won't even compile" cycles.
+Then always include that file in `suspect_files`, even if the AI plan picked something else.
 
-### 5. Planner reads files before committing to suspects
+### 4. Make repair attempts build on the latest PR branch state
 
-In `runPlan`, after the model proposes `suspect_files`, fetch their contents and run a second AI pass that confirms/revises the list and produces a more concrete `proposed_change`. Roughly doubles the plan-phase cost but vastly improves hit rate.
+Keep the existing behavior of reading from the PR branch, but tighten it:
 
-### 6. Surface what happened in the dashboard
+- Confirm suspect files exist on the PR branch.
+- Prefer files mentioned in CI logs over prior suspect files.
+- When the failure points to a Hermes-introduced syntax artifact, ask for a minimal revert/fix rather than another feature change.
 
-`CheckRunList` already shows checks. Add:
+### 5. Add agent self-improvement memory in the PR
 
-- A collapsible "Failure detail" per failed check showing the captured log excerpt.
-- The diagnosis the AI produced for the current repair attempt (already stored in `loop.plan.hypothesis` after repair) — render it inline so you can tell whether the AI understood the failure.
+Update `.hermes/plan.md` on every repair attempt with:
 
-### 7. Add a `NETLIFY_AUTH_TOKEN` secret prompt
+- latest failing check summary
+- parsed root cause
+- files changed in the repair
+- validation results
+- attempt count
 
-When a loop's target repo has Netlify checks, prompt the user once via `add_secret` to provide a Netlify personal access token. Without it we can still scrape the public deploy log page; with it we get clean structured logs.
+This makes the PR explain what Hermes learned and how it improved the fix.
 
-## Technical notes
+### 6. Improve dashboard visibility
 
-- **Files to change**: `src/lib/github-app.server.ts` (richer check fetcher + Netlify log fetcher), `src/lib/hermes.server.ts` (rewrite `runPatch`, expand `runDiagnoseFailure`, add second pass in `runPlan`, add pre-flight parser), `src/components/forge/LoopControl.tsx` (show failure logs + diagnosis inline).
-- **No DB migration needed** — `checks_payload` is already JSON.
-- **TypeScript parser** is in the `typescript` package, already a transitive dep; safe on Cloudflare Workers (pure JS, no FS).
-- **Token budget**: cap total context per AI call at ~60KB to stay within Gemini 2.5 Pro limits with room for reasoning.
-- **Backwards compatible**: existing loops in-flight will just see better data on their next poll.
+In the loop UI, show a compact validation timeline:
 
-## What this won't fix
+- `Patch generated`
+- `Soft checks failed: src/hooks/useGameState.ts:1:2 ...`
+- `Patch repaired`
+- `Soft checks passed`
+- `Pushed commit`
 
-If the underlying Netlify config in the dice repo is itself broken (e.g. wrong publish dir, missing env var), Hermes still can't fix it on the first try — but with real logs it'll at least *report* "Netlify expects `dist/` but build outputs to `build/`" instead of randomly editing source files. After the next repair pass it should converge.
+That tells you whether the failure came from the repo itself or from Hermes producing invalid code.
 
-## Suggested order of execution
+## Why this is the right approach
 
-Steps 1 + 2 + 6 together give you the biggest win and are independently shippable — you'll immediately see *why* checks fail and what Hermes thinks about it. Then 3 + 4 to actually improve patch quality. Step 5 last (it's an optimization). Step 7 only if Netlify HTML scraping proves unreliable.
+Netlify should become the **outer truth source**, not the first validator. Hermes needs a cheap internal “preflight” layer before every commit so obvious syntax corruption is fixed immediately. Then the deployed checks handle deeper issues like missing packages, test failures, type errors, and runtime build configuration.
+
+## What this will not solve immediately
+
+This will not guarantee every PR passes on the first attempt. It will, however, prevent the worst class of failures: Hermes committing syntactically invalid files. For deeper failures, the loop will now have better evidence and a safer retry process.
+
+## Files to change
+
+- `src/lib/hermes.server.ts`
+  - stronger validation
+  - patch self-repair before commit
+  - CI log error extraction
+  - deterministic suspect-file override
+  - `.hermes/plan.md` repair notes
+- `src/lib/github-app.server.ts`
+  - optionally improve Netlify log extraction if needed
+- `src/components/forge/LoopControl.tsx`
+  - show validation/repair evidence in the UI
+
+No database migration is required if we store validation details in the existing `checks_payload` / `plan` JSON fields.

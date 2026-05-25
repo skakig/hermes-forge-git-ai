@@ -403,12 +403,38 @@ function renderPlanMarkdown(loop: LoopRow): string {
 // common "deploy fails because the file no longer parses" cycle.
 function sanityCheck(path: string, contents: string): string | null {
   if (!contents || contents.length < 2) return "file is empty or too short";
+  // Catch common AI-output artifacts that produce instant build failures.
+  // These run before language-specific checks so they apply to all file types.
+  if (/^\uFEFF?\s*```/.test(contents)) return "starts with a markdown code fence (```)";
+  if (/\n```\s*$/.test(contents)) return "ends with a trailing markdown code fence (```)";
+  if (/^\uFEFF?\s*(?:Here(?:'s| is)|Sure[,!]|Below is|I('?| ?'?ve| will)|Okay[,.])/i.test(contents)) {
+    return "starts with a chat-style preamble instead of code";
+  }
+  if (/\u0000/.test(contents)) return "contains null bytes";
+  if (/\uFFFD/.test(contents)) return "contains Unicode replacement characters (corrupt encoding)";
   if (/\.json$/i.test(path)) {
     try { JSON.parse(contents); return null; } catch (e) {
       return `invalid JSON: ${e instanceof Error ? e.message : String(e)}`;
     }
   }
   if (/\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(path)) {
+    // Triple quotes / leading garbage before the first real token — this is
+    // exactly the `'''import ...` failure mode that took down Netlify builds.
+    const head = contents.replace(/^\uFEFF/, "").slice(0, 200);
+    if (/^\s*'{3,}/.test(head)) return "file starts with stray quote characters (e.g. ''')";
+    if (/^\s*"{3,}/.test(head)) return "file starts with stray double-quote characters";
+    // First non-comment, non-blank line must look like valid TS/JS.
+    const firstCode = contents
+      .split(/\r?\n/)
+      .map((l) => l.replace(/^\s+/, ""))
+      .find((l) => l.length > 0 && !l.startsWith("//") && !l.startsWith("/*") && !l.startsWith("*"));
+    if (firstCode && !/^(import\b|export\b|const\b|let\b|var\b|function\b|class\b|type\b|interface\b|enum\b|declare\b|async\b|namespace\b|module\b|@|\/\*|\(|\{|"use |if\b|return\b)/.test(firstCode)) {
+      // Heuristic: a leading line that doesn't begin like JS is suspicious.
+      // Allow JSX returns / arrow IIFEs by checking for "<" too.
+      if (!/^[<;]/.test(firstCode)) {
+        return `first code line does not look like valid JS/TS: ${firstCode.slice(0, 60)}`;
+      }
+    }
     // Strip strings + comments cheaply, then check bracket balance.
     const stripped = contents
       .replace(/\/\*[\s\S]*?\*\//g, "")

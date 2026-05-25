@@ -677,16 +677,47 @@ async function runPatch(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
   // Apply edits: sanity-check first, then write only files that pass.
   let edits = 0;
   const skipped: string[] = [];
+  const validationNotes: string[] = [];
+  const repaired: string[] = [];
   for (const e of proposed) {
     const src = loaded.find((l) => l.path === e.path);
     if (!src) { skipped.push(`${e.path}: not in scope`); continue; }
     if (!e.changed || e.new_contents === src.content) continue;
-    const reason = sanityCheck(e.path, e.new_contents);
+    let toWrite = e.new_contents;
+    let reason = sanityCheck(e.path, toWrite);
+    if (reason) {
+      validationNotes.push(`${e.path}: rejected (${reason}); attempting one-shot repair…`);
+      try {
+        const repairedContents = await repairProposedFile({
+          path: e.path,
+          rejectedContents: toWrite,
+          reason,
+          originalContents: src.content,
+          hypothesis: loop.plan?.hypothesis ?? "",
+          proposedChange: loop.plan?.proposed_change ?? "",
+        });
+        if (repairedContents) {
+          const reason2 = sanityCheck(e.path, repairedContents);
+          if (!reason2) {
+            toWrite = repairedContents;
+            reason = null;
+            repaired.push(e.path);
+            validationNotes.push(`${e.path}: repair passed validation`);
+          } else {
+            validationNotes.push(`${e.path}: repair still invalid (${reason2})`);
+          }
+        } else {
+          validationNotes.push(`${e.path}: repair returned no contents`);
+        }
+      } catch (err) {
+        validationNotes.push(`${e.path}: repair errored (${err instanceof Error ? err.message : String(err)})`);
+      }
+    }
     if (reason) { skipped.push(`${e.path}: ${reason}`); continue; }
     try {
       await putFile(token, repo.owner, repo.name, {
         path: e.path,
-        content: e.new_contents,
+        content: toWrite,
         branch: loop.branch,
         message: `forge: ${(e.note || "automated edit").slice(0, 60)}`,
         sha: src.sha,
@@ -697,12 +728,47 @@ async function runPatch(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
     }
   }
 
+  // Append a repair-attempt note to the PR plan marker so the human reviewer
+  // (and the next Hermes attempt) can see what we tried and what was rejected.
+  if (validationNotes.length || repaired.length || skipped.length) {
+    try {
+      const markerPath = ".hermes/plan.md";
+      const existing = await getFileContents(token, repo.owner, repo.name, markerPath, loop.branch);
+      if (existing) {
+        const block = [
+          ``,
+          `---`,
+          ``,
+          `## Attempt ${(loop.attempt_count ?? 0) + (loop.phase === "repair_patch" ? 1 : 0)} · pre-commit validation`,
+          ``,
+          `- Edits applied: ${edits}`,
+          `- Files repaired in-flight: ${repaired.length ? repaired.map((p) => `\`${p}\``).join(", ") : "none"}`,
+          `- Skipped: ${skipped.length ? skipped.slice(0, 8).map((s) => `\`${s}\``).join("; ") : "none"}`,
+          ...(validationNotes.length ? [``, `**Validator notes:**`, ...validationNotes.map((n) => `- ${n}`)] : []),
+        ].join("\n");
+        await putFile(token, repo.owner, repo.name, {
+          path: markerPath,
+          content: existing.content + "\n" + block + "\n",
+          branch: loop.branch,
+          message: "chore(hermes): record validation notes",
+          sha: existing.sha,
+        });
+      }
+    } catch { /* non-fatal */ }
+  }
+
   const parts: string[] = [];
   parts.push(edits === 0 ? "No file edits were applied" : `Patched ${edits} file${edits === 1 ? "" : "s"}`);
+  if (repaired.length) parts.push(`${repaired.length} auto-repaired pre-commit`);
   if (skipped.length) parts.push(`${skipped.length} skipped: ${skipped.slice(0, 3).join("; ")}`);
   if (errors.length) parts.push(`${errors.length} load error${errors.length === 1 ? "" : "s"}`);
   return {
     phase: "commit",
+    plan: {
+      ...(loop.plan ?? {}),
+      // @ts-expect-error stored alongside plan for UI rendering
+      validation_notes: validationNotes.slice(-20),
+    },
     message: parts.join(" · "),
     comment_kind: "progress",
   };

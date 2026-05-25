@@ -443,3 +443,74 @@ export async function markPRReadyForReview(token: string, prNodeId: string): Pro
   const json = (await res.json()) as { errors?: Array<{ message: string }> };
   if (json.errors?.length) throw new Error(`gh_graphql: ${json.errors.map((e) => e.message).join("; ")}`);
 }
+
+// -------------------------------------------------------------------------
+// CI checks
+// -------------------------------------------------------------------------
+
+export type CheckRunDTO = {
+  name: string;
+  status: string; // queued | in_progress | completed
+  conclusion: string | null; // success | failure | neutral | cancelled | timed_out | action_required | skipped
+  html_url: string | null;
+  output_title: string | null;
+  output_summary: string | null;
+};
+
+export type StatusDTO = {
+  context: string;
+  state: string; // success | failure | pending | error
+  description: string | null;
+  target_url: string | null;
+};
+
+export async function getPRHeadSha(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<string> {
+  const pr = await gh<{ head: { sha: string } }>(
+    token,
+    `/repos/${owner}/${repo}/pulls/${prNumber}`,
+  );
+  return pr.head.sha;
+}
+
+export async function listPRChecks(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<{ runs: CheckRunDTO[]; statuses: StatusDTO[]; headSha: string }> {
+  const headSha = await getPRHeadSha(token, owner, repo, prNumber);
+  const [checkRes, statusRes] = await Promise.all([
+    gh<{
+      check_runs: Array<{
+        name: string;
+        status: string;
+        conclusion: string | null;
+        html_url: string | null;
+        output?: { title: string | null; summary: string | null };
+      }>;
+    }>(token, `/repos/${owner}/${repo}/commits/${headSha}/check-runs?per_page=100`),
+    gh<{
+      statuses: Array<{
+        context: string;
+        state: string;
+        description: string | null;
+        target_url: string | null;
+      }>;
+    }>(token, `/repos/${owner}/${repo}/commits/${headSha}/status`),
+  ]);
+  const runs: CheckRunDTO[] = (checkRes.check_runs ?? []).map((r) => ({
+    name: r.name,
+    status: r.status,
+    conclusion: r.conclusion,
+    html_url: r.html_url,
+    output_title: r.output?.title ?? null,
+    output_summary: r.output?.summary ?? null,
+  }));
+  const statuses: StatusDTO[] = statusRes.statuses ?? [];
+  return { runs, statuses, headSha };
+}

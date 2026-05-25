@@ -11,8 +11,10 @@ import {
   createPullRequest,
   addPRComment,
   markPRReadyForReview,
+  listPRChecks,
   type RepoTreeEntry,
 } from "./github-app.server";
+import { supabaseAdmin } from "@/integrations/supabase/client.server";
 
 const AI_URL = "https://ai.gateway.lovable.dev/v1/chat/completions";
 const DEFAULT_MODEL = "google/gemini-2.5-pro";
@@ -100,6 +102,10 @@ export type LoopRow = {
   suspect_files: string[];
   pr_number: number | null;
   pr_url: string | null;
+  attempt_count?: number;
+  max_attempts?: number;
+  checks_status?: string | null;
+  checks_payload?: Record<string, unknown> | null;
 };
 
 export type RepoRow = {
@@ -120,6 +126,11 @@ export type PhasePatch = {
   pr_url?: string;
   pr_is_draft?: boolean;
   finished_at?: string;
+  attempt_count?: number;
+  last_error?: string | null;
+  checks_status?: string | null;
+  checks_payload?: Record<string, unknown>;
+  next_run_at?: string | null;
   message: string;
   comment_kind?: "progress" | "pr_opened" | "completed" | "error";
 };
@@ -147,6 +158,12 @@ export async function runPhase(ctx: PhaseCtx): Promise<PhasePatch> {
       return runCommit(ctx, token);
     case "ready":
       return runReady(ctx, token);
+    case "checks_pending":
+      return runChecksPending(ctx, token);
+    case "diagnose_failure":
+      return runDiagnoseFailure(ctx);
+    case "repair_patch":
+      return runPatch(ctx, token);
     default:
       return { message: `Phase "${ctx.loop.phase}" has no runner.`, comment_kind: "progress" };
   }

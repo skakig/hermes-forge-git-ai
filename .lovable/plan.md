@@ -1,69 +1,79 @@
-What’s going on
 
-- Hermes is currently a request-driven agent, not a real background worker. The dashboard calls `pollLoopStatus`, and that one web request tries to run several slow phases: audit, plan, create PR, ask AI to edit files, push commits, then mark the PR ready.
-- That explains the waiting/reload behavior: GitHub may already have the PR/commits, but the dashboard only reflects success after the next poll/reload sees the database row updated.
-- The failed GitHub checks in your screenshots are Netlify/deploy checks on the target repo. Hermes can create code changes, but right now it does not read CI/deploy failure logs, diagnose them, and push a corrective commit. So “PR created” does not mean “PR is correct and deployable.”
-- The current patcher is also too shallow for true self-improvement: it picks up to 5 suspect files, asks the model to rewrite each file independently, and does not run tests/builds or inspect the resulting app before declaring the loop complete.
+## Why every PR fails right now
 
-Best way to make this actually auto-improve
+Your screenshot shows the dice repo PR has 4 failed Netlify checks (`Deploy Preview failed`, `Pages changed`, `Header rules`, `Redirect rules`). The Hermes agent did everything correctly *except* the part that matters: it opened a PR with code Netlify can't build.
 
-1. Replace request-driven polling with a durable job queue
-   - Starting a loop should enqueue work and return immediately.
-   - A worker endpoint processes one phase/job at a time with locks, retries, and persisted progress.
-   - The dashboard becomes a live monitor, not the thing responsible for making Hermes run.
+Looking at `hermes.server.ts` + `github-app.server.ts`, the real problems are:
 
-2. Add a CI/check feedback phase
-   - After pushing commits, Hermes should poll GitHub check runs/statuses for the PR branch.
-   - If checks fail, it should collect the failing check names and links/log excerpts where available.
-   - The loop should not show “completed” until checks are green, explicitly blocked, or max repair attempts are exhausted.
+1. **Hermes can't see why checks failed.** `listPRChecks` only captures check `name` + a one-line `summary`. The diagnose step gets fed `"netlify/farklerocks/deploy-preview: Deploy Preview failed."` — there's no build log, no stack trace, no annotation. The AI is guessing blindfolded, so the "repair" patch is random.
+2. **The patcher edits files in isolation.** `runPatch` loops file-by-file, sending each file alone to the AI with no awareness of imports, types, or sibling files. The model invents APIs that don't exist, breaks types, or removes exports something else depends on.
+3. **The planner picks "suspect files" without reading them.** `runPlan` chooses up to 5 paths from a one-paragraph repo brief, never opens them, then commands edits. Often the wrong files.
+4. **No pre-flight check before pushing.** Hermes commits → Netlify builds → fails. There's no "does this even parse" gate.
 
-3. Add a repair loop
-   - New phases: `checks_pending`, `diagnose_failure`, `repair_patch`, `repair_commit`, then back to `checks_pending`.
-   - Store `attempt_count`, `last_error`, and failed check metadata on the loop.
-   - Cap attempts, for example 3 repair attempts per PR, so it does not thrash forever.
+So you're not doing anything wrong — the agent is shipping unvalidated guesses. Here's the path forward.
 
-4. Improve code-edit quality
-   - Instead of editing isolated files blindly, have Hermes read relevant neighboring files and config files: package.json, build config, deploy config, tests, and files referenced by failing logs.
-   - Prefer small targeted patches and commit messages that explain the fix.
-   - If no confident patch is possible, leave the PR open with a clear “needs human review” status rather than claiming success.
+## Plan
 
-5. Make dashboard statuses honest
-   - Split PR state from agent state:
-     - PR opened
-     - Commits pushed
-     - Checks running
-     - Checks failed; repairing
-     - Ready for review
-     - Blocked
-   - Show the GitHub PR link even when the agent fails.
-   - Add a “Resume/Retry repair” action for failed or blocked loops.
+### 1. Capture real failure evidence (highest impact)
 
-Technical implementation plan
+Extend `listPRChecks` in `github-app.server.ts` to pull richer data per failing check:
 
-- Database migration:
-  - Add queue/job metadata, e.g. `loop_jobs` or equivalent columns on `loops`.
-  - Add fields such as `attempt_count`, `max_attempts`, `last_error`, `checks_status`, `checks_payload`, `next_run_at`.
-  - Keep RLS scoped to the authenticated user.
+- **GitHub check-runs**: also fetch `output.text` (full log body, up to 64KB) and `/check-runs/{id}/annotations` (file + line + message). This is what Lovable's own build checks return — should give us actionable info immediately.
+- **External statuses (Netlify)**: for each failing status, fetch the `target_url` HTML and extract the deploy-log snippet, OR (better) if user adds a `NETLIFY_AUTH_TOKEN` secret, hit `https://api.netlify.com/api/v1/deploys/{id}/log` for the structured build log. Detect the deploy ID from the `target_url` pattern.
+- Store the trimmed log (last ~6KB per failed check, tail-biased — errors are at the bottom) into `checks_payload.failure_logs`.
 
-- Server functions/routes:
-  - Keep `startHermesLoop` as the user-facing function that creates the loop and enqueues the first job.
-  - Add a secured worker route under `/api/public/...` for scheduled/background processing, protected by a secret header.
-  - Add server helpers to list PR check runs/statuses from GitHub.
-  - Add phase runners for check polling and repair attempts.
+### 2. Make `runDiagnoseFailure` actually diagnose
 
-- GitHub integration:
-  - Fetch PR head SHA and associated check runs/statuses.
-  - Treat Netlify/deploy failures as a first-class signal.
-  - Store failing check names, URLs, conclusion, and summary in the loop activity.
+Today it sees check names. Change it to:
 
-- Dashboard:
-  - Show the real phase/check state instead of only `completed`/`failed`.
-  - Link directly to failed checks and the PR.
-  - Add retry/resume for blocked loops.
+- Include the **failure log excerpts** from step 1 in the prompt.
+- **Read the current contents** of `suspect_files` from the PR branch AND `package.json`, `vite.config.*`, `netlify.toml`, `tsconfig.json`. Send them as context.
+- Ask for a **structured patch** (path + full new contents per file) in a single tool call, not just a "diagnosis + file list" that then triggers another isolated patch round.
 
-Expected outcome
+### 3. Coherent multi-file patching in one shot
 
-- Hermes will no longer depend on the browser tab being open or a manual reload to continue.
-- The dashboard will show accurate progress while GitHub checks run.
-- A failed Netlify check becomes input for another Hermes repair attempt instead of the endpoint marking the loop done.
-- The system becomes a real self-improvement cycle: propose change, push PR, observe CI/deploy, repair, repeat until green or safely blocked.
+Replace the current per-file loop in `runPatch` with a single AI call that:
+
+- Receives **all** suspect files + their current contents together (cap total at ~40KB).
+- Returns an array of `{ path, new_contents, changed, note }` so cross-file changes stay consistent.
+- Falls back to per-file mode only if the bundle exceeds the size cap.
+
+### 4. Cheap pre-flight before committing
+
+Before `putFile` writes each edit, run a minimum sanity gate:
+
+- **Syntax parse** for `.ts/.tsx/.js/.jsx` files (use TypeScript's `ts.createSourceFile` parser — runs fine on Workers, no FS needed). If a file doesn't parse, drop that edit and log it instead of pushing broken code.
+- For `.json`, run `JSON.parse`. For `.toml`, basic bracket-balance check.
+
+This alone will eliminate most "deploy failed because the build won't even compile" cycles.
+
+### 5. Planner reads files before committing to suspects
+
+In `runPlan`, after the model proposes `suspect_files`, fetch their contents and run a second AI pass that confirms/revises the list and produces a more concrete `proposed_change`. Roughly doubles the plan-phase cost but vastly improves hit rate.
+
+### 6. Surface what happened in the dashboard
+
+`CheckRunList` already shows checks. Add:
+
+- A collapsible "Failure detail" per failed check showing the captured log excerpt.
+- The diagnosis the AI produced for the current repair attempt (already stored in `loop.plan.hypothesis` after repair) — render it inline so you can tell whether the AI understood the failure.
+
+### 7. Add a `NETLIFY_AUTH_TOKEN` secret prompt
+
+When a loop's target repo has Netlify checks, prompt the user once via `add_secret` to provide a Netlify personal access token. Without it we can still scrape the public deploy log page; with it we get clean structured logs.
+
+## Technical notes
+
+- **Files to change**: `src/lib/github-app.server.ts` (richer check fetcher + Netlify log fetcher), `src/lib/hermes.server.ts` (rewrite `runPatch`, expand `runDiagnoseFailure`, add second pass in `runPlan`, add pre-flight parser), `src/components/forge/LoopControl.tsx` (show failure logs + diagnosis inline).
+- **No DB migration needed** — `checks_payload` is already JSON.
+- **TypeScript parser** is in the `typescript` package, already a transitive dep; safe on Cloudflare Workers (pure JS, no FS).
+- **Token budget**: cap total context per AI call at ~60KB to stay within Gemini 2.5 Pro limits with room for reasoning.
+- **Backwards compatible**: existing loops in-flight will just see better data on their next poll.
+
+## What this won't fix
+
+If the underlying Netlify config in the dice repo is itself broken (e.g. wrong publish dir, missing env var), Hermes still can't fix it on the first try — but with real logs it'll at least *report* "Netlify expects `dist/` but build outputs to `build/`" instead of randomly editing source files. After the next repair pass it should converge.
+
+## Suggested order of execution
+
+Steps 1 + 2 + 6 together give you the biggest win and are independently shippable — you'll immediately see *why* checks fail and what Hermes thinks about it. Then 3 + 4 to actually improve patch quality. Step 5 last (it's an optimization). Step 7 only if Netlify HTML scraping proves unreliable.

@@ -449,6 +449,7 @@ export async function markPRReadyForReview(token: string, prNodeId: string): Pro
 // -------------------------------------------------------------------------
 
 export type CheckRunDTO = {
+  id: number;
   name: string;
   status: string; // queued | in_progress | completed
   conclusion: string | null; // success | failure | neutral | cancelled | timed_out | action_required | skipped
@@ -487,6 +488,7 @@ export async function listPRChecks(
   const [checkRes, statusRes] = await Promise.all([
     gh<{
       check_runs: Array<{
+        id: number;
         name: string;
         status: string;
         conclusion: string | null;
@@ -504,6 +506,7 @@ export async function listPRChecks(
     }>(token, `/repos/${owner}/${repo}/commits/${headSha}/status`),
   ]);
   const runs: CheckRunDTO[] = (checkRes.check_runs ?? []).map((r) => ({
+    id: r.id,
     name: r.name,
     status: r.status,
     conclusion: r.conclusion,
@@ -513,4 +516,110 @@ export async function listPRChecks(
   }));
   const statuses: StatusDTO[] = statusRes.statuses ?? [];
   return { runs, statuses, headSha };
+}
+
+// -------------------------------------------------------------------------
+// Failure log extraction. For each failing check, try to produce a string
+// of real error output the AI can reason about — not just "Deploy failed."
+// -------------------------------------------------------------------------
+
+const MAX_LOG_CHARS = 6000; // tail-biased: errors live at the end of build logs
+
+function tail(s: string, n = MAX_LOG_CHARS): string {
+  if (!s) return "";
+  const trimmed = s.replace(/\u001b\[[0-9;]*m/g, ""); // strip ANSI colors
+  return trimmed.length <= n ? trimmed : "…[truncated]…\n" + trimmed.slice(-n);
+}
+
+export type FailureLog = {
+  name: string;
+  kind: "check_run" | "status";
+  url: string | null;
+  log: string;
+};
+
+async function fetchCheckRunOutputText(
+  token: string,
+  owner: string,
+  repo: string,
+  id: number,
+): Promise<string> {
+  try {
+    const r = await gh<{ output?: { title?: string | null; summary?: string | null; text?: string | null } }>(
+      token,
+      `/repos/${owner}/${repo}/check-runs/${id}`,
+    );
+    const parts = [r.output?.title, r.output?.summary, r.output?.text].filter(Boolean) as string[];
+    let body = parts.join("\n\n");
+    try {
+      const ann = await gh<Array<{ path?: string; start_line?: number; message?: string; annotation_level?: string }>>(
+        token,
+        `/repos/${owner}/${repo}/check-runs/${id}/annotations?per_page=30`,
+      );
+      if (ann?.length) {
+        body += "\n\nAnnotations:\n" + ann
+          .map((a) => `- [${a.annotation_level ?? "info"}] ${a.path ?? ""}:${a.start_line ?? "?"} — ${a.message ?? ""}`)
+          .join("\n");
+      }
+    } catch {
+      /* non-fatal */
+    }
+    return body;
+  } catch (e) {
+    return `(could not fetch check-run detail: ${e instanceof Error ? e.message : String(e)})`;
+  }
+}
+
+async function fetchNetlifyDeployLog(targetUrl: string): Promise<string> {
+  // Netlify's deploy log page is rendered client-side, but the public
+  // "deploy-log" page contains a JSON blob with the build log. We do a
+  // best-effort scrape: fetch the page, look for the most-recent "Build
+  // failed" / error lines. If unavailable, fall back to the URL.
+  try {
+    const res = await fetch(targetUrl, {
+      headers: { "User-Agent": "hermes-forge/1.0 (+https://hermes-forge-git-ai.lovable.app)" },
+    });
+    if (!res.ok) return `(netlify page returned ${res.status})`;
+    const html = await res.text();
+    // Crude: look for any pre-rendered log lines that mention error / failed / exited.
+    const lines = html
+      .split(/\r?\n/)
+      .filter((l) => /error|failed|exit code|cannot find|module not found|enoent|✘|✖/i.test(l))
+      .slice(-40)
+      .map((l) => l.replace(/<[^>]+>/g, "").trim())
+      .filter(Boolean);
+    if (lines.length) return lines.join("\n");
+    return `(no log lines extracted from ${targetUrl})`;
+  } catch (e) {
+    return `(netlify fetch failed: ${e instanceof Error ? e.message : String(e)})`;
+  }
+}
+
+export async function collectFailureLogs(
+  token: string,
+  owner: string,
+  repo: string,
+  failing: Array<{
+    name: string;
+    state: string;
+    url: string | null;
+    summary: string | null;
+    kind: "check_run" | "status";
+    check_run_id?: number;
+  }>,
+): Promise<FailureLog[]> {
+  const out: FailureLog[] = [];
+  // Cap concurrency lightly to be polite to GitHub/Netlify.
+  for (const f of failing.slice(0, 8)) {
+    let log = "";
+    if (f.kind === "check_run" && f.check_run_id) {
+      log = await fetchCheckRunOutputText(token, owner, repo, f.check_run_id);
+    } else if (f.kind === "status" && f.url && /netlify\.com\/.+\/deploys\//i.test(f.url)) {
+      log = await fetchNetlifyDeployLog(f.url);
+    } else if (f.summary) {
+      log = f.summary;
+    }
+    out.push({ name: f.name, kind: f.kind, url: f.url, log: tail(log) });
+  }
+  return out;
 }

@@ -105,7 +105,7 @@ export type LoopRow = {
   attempt_count?: number;
   max_attempts?: number;
   checks_status?: string | null;
-  checks_payload?: Record<string, unknown> | null;
+  checks_payload?: import("@/integrations/supabase/types").Json | null;
 };
 
 export type RepoRow = {

@@ -8,13 +8,13 @@ import {
 import { toast } from "sonner";
 import { useServerFn } from "@tanstack/react-start";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { startHermesLoop, pollLoopStatus, listLoops, cancelLoop } from "@/lib/hermes.functions";
+import { startHermesLoop, pollLoopStatus, listLoops, cancelLoop, resumeLoop } from "@/lib/hermes.functions";
 import { listConnectedRepos } from "@/lib/dashboard.functions";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 
-const phaseOrder = ["audit", "plan", "draft_pr", "patch", "commit", "ready", "completed"];
+const phaseOrder = ["audit", "plan", "draft_pr", "patch", "commit", "ready", "checks_pending", "completed"];
 const phaseLabels: Record<string, string> = {
   audit: "Auditing source tree",
   plan: "Forming a plan",
@@ -22,8 +22,12 @@ const phaseLabels: Record<string, string> = {
   patch: "Editing files",
   commit: "Pushing commits",
   ready: "Flipping to ready for review",
+  checks_pending: "Waiting on CI checks",
+  diagnose_failure: "Diagnosing failed checks",
+  repair_patch: "Patching to fix CI",
   completed: "Done",
   error: "Failed",
+  blocked: "Blocked · needs human review",
   canceled: "Canceled",
 };
 
@@ -34,6 +38,7 @@ export function LoopControl() {
   const startFn = useServerFn(startHermesLoop);
   const pollFn = useServerFn(pollLoopStatus);
   const cancelFn = useServerFn(cancelLoop);
+  const resumeFn = useServerFn(resumeLoop);
   const [selectedRepo, setSelectedRepo] = useState<string | undefined>();
   const [bugReport, setBugReport] = useState("");
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -85,6 +90,19 @@ export function LoopControl() {
     },
     onError: (e) => toast.error(e instanceof Error ? e.message : "Cancel failed"),
   });
+
+  const resumeMutation = useMutation({
+    mutationFn: (loop_id: string) => resumeFn({ data: { loop_id } }),
+    onSuccess: () => {
+      toast("Loop resumed");
+      queryClient.invalidateQueries({ queryKey: ["forge"] });
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "Resume failed"),
+  });
+
+  const lastFailed = loopsQuery.data?.loops.find(
+    (l) => l.status === "failed" || l.phase === "blocked",
+  );
 
   const repos = reposQuery.data?.repos ?? [];
   const running = !!activeLoop;
@@ -206,6 +224,24 @@ export function LoopControl() {
           ) : null}
         </div>
       )}
+      {!running && lastFailed ? (
+        <div className="relative mt-6 flex items-center justify-between gap-4 rounded-lg border border-amber-500/30 bg-amber-500/5 p-4">
+          <div className="text-sm text-amber-200/90">
+            Last loop ended in <span className="font-mono uppercase">{lastFailed.phase}</span>.
+            {lastFailed.pr_url ? (
+              <> <a href={lastFailed.pr_url} target="_blank" rel="noreferrer" className="underline">View PR #{lastFailed.pr_number}</a>.</>
+            ) : null}
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => resumeMutation.mutate(lastFailed.id)}
+            disabled={resumeMutation.isPending}
+          >
+            Resume / retry repair
+          </Button>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -478,6 +478,29 @@ export async function getPRHeadSha(
   return pr.head.sha;
 }
 
+// Lightweight PR state probe used to decide if a "failing checks" PR was
+// actually merged by a human anyway — in which case the loop is effectively
+// done and should not surface as ERROR in the UI.
+export async function getPRState(
+  token: string,
+  owner: string,
+  repo: string,
+  prNumber: number,
+): Promise<{ state: string; merged: boolean; merge_commit_sha: string | null; html_url: string }> {
+  const pr = await gh<{
+    state: string;
+    merged: boolean;
+    merge_commit_sha: string | null;
+    html_url: string;
+  }>(token, `/repos/${owner}/${repo}/pulls/${prNumber}`);
+  return {
+    state: pr.state,
+    merged: !!pr.merged,
+    merge_commit_sha: pr.merge_commit_sha ?? null,
+    html_url: pr.html_url,
+  };
+}
+
 export async function listPRChecks(
   token: string,
   owner: string,

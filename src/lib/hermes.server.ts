@@ -780,10 +780,18 @@ async function runPatch(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
     "Return a coherent set of edits via the apply_edits tool. Make the MINIMUM change needed. Preserve unrelated code, formatting, comments, imports, and types. " +
     "If a file does not need to change, omit it from the edits array. Never invent APIs. If the failure logs point at a config file or an import that doesn't exist, fix the import or revert the offending change rather than editing more code.";
 
+  // Inject the research rules brief (if the research phase produced one) so
+  // the engineer codes against the authoritative spec, not guesses.
+  const research = (loop.plan as { research?: ResearchBlock } | null)?.research;
+  const researchPrompt = research && research.rules_extracted && research.rules_extracted !== "No external spec applies."
+    ? `\n\nAUTHORITATIVE RULES (implement EXACTLY these; do not invent additional behavior):\n${research.rules_extracted}\n\nSources: ${research.sources.map((s) => s.url).join(", ")}`
+    : "";
+  const fullSystemMsg = systemMsg + researchPrompt;
+
   if (useBundle) {
     const ai = await callAI({
       messages: [
-        { role: "system", content: systemMsg },
+        { role: "system", content: fullSystemMsg },
         {
           role: "user",
           content: [
@@ -835,7 +843,7 @@ async function runPatch(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
     for (const f of loaded) {
       const ai = await callAI({
         messages: [
-          { role: "system", content: systemMsg },
+          { role: "system", content: fullSystemMsg },
           {
             role: "user",
             content: [

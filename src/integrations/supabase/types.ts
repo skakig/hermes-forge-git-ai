@@ -126,6 +126,8 @@ export type Database = {
           hermes_run_id: string | null
           id: string
           phase: string
+          phase_running: boolean
+          phase_started_at: string | null
           plan: Json | null
           pr_is_draft: boolean
           pr_number: number | null
@@ -146,6 +148,8 @@ export type Database = {
           hermes_run_id?: string | null
           id?: string
           phase?: string
+          phase_running?: boolean
+          phase_started_at?: string | null
           plan?: Json | null
           pr_is_draft?: boolean
           pr_number?: number | null
@@ -166,6 +170,8 @@ export type Database = {
           hermes_run_id?: string | null
           id?: string
           phase?: string
+          phase_running?: boolean
+          phase_started_at?: string | null
           plan?: Json | null
           pr_is_draft?: boolean
           pr_number?: number | null

@@ -261,31 +261,64 @@ async function runPlan(ctx: PhaseCtx): Promise<PhasePatch> {
 
 async function runDraftPr(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
   const { repo, loop } = ctx;
-  const branch = loop.branch ?? `forge/auto-${Date.now()}`;
+  // Stable, deterministic branch name keyed to the loop id — eliminates
+  // races from parallel pollers and lets us safely retry.
+  const branch = loop.branch ?? `forge/auto-${loop.id.slice(0, 8)}`;
   const headSha = await getBranchHeadSha(token, repo.owner, repo.name, repo.default_branch);
-  await createBranch(token, repo.owner, repo.name, branch, headSha);
+  try {
+    await createBranch(token, repo.owner, repo.name, branch, headSha);
+  } catch (e) {
+    // "Reference already exists" → branch is already there; safe to continue.
+    if (!(e instanceof Error) || !/gh_422/.test(e.message)) throw e;
+  }
 
   // GitHub disallows opening a PR with no diff between head and base, so we
-  // stage an empty marker file on the new branch first. It will be replaced
-  // (or kept as a hidden footprint) during the patch phase.
+  // stage a marker file on the new branch first. It will be updated during
+  // the patch phase. Use the existing file SHA if it already exists.
   const markerPath = ".hermes/plan.md";
   const planBody = renderPlanMarkdown(loop);
-  await putFile(token, repo.owner, repo.name, {
-    path: markerPath,
-    content: planBody,
-    branch,
-    message: "chore(hermes): seed plan",
-  });
+  const existingMarker = await getFileContents(token, repo.owner, repo.name, markerPath, branch);
+  try {
+    await putFile(token, repo.owner, repo.name, {
+      path: markerPath,
+      content: planBody,
+      branch,
+      message: "chore(hermes): seed plan",
+      ...(existingMarker ? { sha: existingMarker.sha } : {}),
+    });
+  } catch (e) {
+    // If content hasn't changed GitHub may 422 — non-fatal.
+    if (!(e instanceof Error) || !/gh_422/.test(e.message)) throw e;
+  }
 
   const planArg = loop.plan as (LoopRow["plan"] & { pr_title?: string }) | null;
   const title = planArg?.pr_title?.slice(0, 72) || `forge: ${planArg?.hypothesis?.slice(0, 60) ?? "automated improvement"}`;
-  const pr = await createPullRequest(token, repo.owner, repo.name, {
-    title,
-    head: branch,
-    base: repo.default_branch,
-    body: planBody,
-    draft: true,
-  });
+  let pr: { number: number; html_url: string; node_id: string; draft: boolean };
+  try {
+    pr = await createPullRequest(token, repo.owner, repo.name, {
+      title,
+      head: branch,
+      base: repo.default_branch,
+      body: planBody,
+      draft: true,
+    });
+  } catch (e) {
+    // PR already exists for this branch → fetch it and reuse.
+    if (!(e instanceof Error) || !/gh_422/.test(e.message)) throw e;
+    const list = await fetch(
+      `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls?head=${repo.owner}:${branch}&state=open`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": "hermes-forge",
+        },
+      },
+    );
+    const existing = (await list.json()) as Array<{ number: number; html_url: string; node_id: string; draft: boolean }>;
+    if (!existing?.[0]) throw e;
+    pr = existing[0];
+  }
   return {
     phase: "patch",
     branch,

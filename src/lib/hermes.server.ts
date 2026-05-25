@@ -577,12 +577,15 @@ async function runChecksPending(ctx: PhaseCtx, token: string): Promise<PhasePatc
       state: r.status === "completed" ? (r.conclusion ?? "neutral") : "pending",
       url: r.html_url,
       summary: r.output_title ?? r.output_summary ?? null,
+      kind: "check_run" as const,
+      check_run_id: r.id,
     })),
     ...statuses.map((s) => ({
       name: s.context,
       state: s.state,
       url: s.target_url,
       summary: s.description,
+      kind: "status" as const,
     })),
   ];
 
@@ -604,11 +607,22 @@ async function runChecksPending(ctx: PhaseCtx, token: string): Promise<PhasePatc
     : Date.now();
   const expired = Date.now() - startedAt > CHECKS_POLL_WINDOW_MS;
 
+  // For failures, pull real logs so the diagnose step has something to chew on.
+  let failureLogs: FailureLog[] = [];
+  if (failed.length > 0) {
+    try {
+      failureLogs = await collectFailureLogs(token, repo.owner, repo.name, failed);
+    } catch (e) {
+      console.error("collectFailureLogs failed:", e);
+    }
+  }
+
   const payload = {
     head_sha: headSha,
     started_at: new Date(startedAt).toISOString(),
     last_checked_at: new Date().toISOString(),
-    checks: allChecks,
+    checks: allChecks.map(({ kind: _k, check_run_id: _id, ...rest }) => rest),
+    failure_logs: failureLogs,
   } as unknown as import("@/integrations/supabase/types").Json;
 
   if (succeeded) {

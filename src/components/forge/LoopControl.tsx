@@ -61,9 +61,15 @@ function CheckRunList({
   const checks = payload.checks ?? [];
   const failureLogs = payload.failure_logs ?? [];
   const plan = (loop.plan ?? {}) as { hypothesis?: string; proposed_change?: string };
+  const planExtra = (loop.plan ?? {}) as {
+    validation_notes?: string[];
+    build_errors?: Array<{ path: string; line: number; col: number; message: string }>;
+  };
   const showDiagnosis = (loop.phase === "diagnose_failure" || loop.phase === "repair_patch" || loop.phase === "blocked")
     && (plan.hypothesis || plan.proposed_change);
-  if (!loop.checks_status && checks.length === 0 && !loop.last_error && !showDiagnosis) return null;
+  const hasValidationNotes = (planExtra.validation_notes?.length ?? 0) > 0;
+  const hasBuildErrors = (planExtra.build_errors?.length ?? 0) > 0;
+  if (!loop.checks_status && checks.length === 0 && !loop.last_error && !showDiagnosis && !hasValidationNotes && !hasBuildErrors) return null;
   const attempts = loop.attempt_count ?? 0;
   const max = loop.max_attempts ?? 3;
   return (
@@ -96,7 +102,29 @@ function CheckRunList({
           {plan.proposed_change ? (
             <div className="mt-1 text-xs text-amber-100/70"><span className="text-amber-300/80">Fix:</span> {plan.proposed_change}</div>
           ) : null}
+          {hasBuildErrors ? (
+            <div className="mt-2 grid gap-0.5">
+              <div className="text-[10px] uppercase tracking-wider text-amber-300/80">Parsed build errors</div>
+              {planExtra.build_errors!.slice(0, 5).map((e, i) => (
+                <div key={i} className="text-[11px] font-mono text-amber-100/80">
+                  {e.path}:{e.line}:{e.col} — {e.message}
+                </div>
+              ))}
+            </div>
+          ) : null}
         </div>
+      ) : null}
+      {hasValidationNotes ? (
+        <details className="mt-3 group">
+          <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground select-none">
+            Pre-commit validation ({planExtra.validation_notes!.length}) — click to expand
+          </summary>
+          <ul className="mt-2 grid gap-0.5 text-[11px] font-mono text-foreground/75">
+            {planExtra.validation_notes!.map((n, i) => (
+              <li key={i} className="whitespace-pre-wrap break-words">{n}</li>
+            ))}
+          </ul>
+        </details>
       ) : null}
       {failureLogs.length > 0 ? (
         <details className="mt-3 group">

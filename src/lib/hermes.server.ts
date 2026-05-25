@@ -717,27 +717,27 @@ async function runPatch(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
     if (!src) { skipped.push(`${e.path}: not in scope`); continue; }
     if (!e.changed || e.new_contents === src.content) continue;
     let toWrite = e.new_contents;
-    let reason = sanityCheck(e.path, toWrite);
-    if (reason) {
-      validationNotes.push(`${e.path}: rejected (${reason}); attempting one-shot repair…`);
+    let v = validateProposedFile(e.path, toWrite);
+    if (!v.ok) {
+      validationNotes.push(`${e.path}: rejected [${v.rule}] ${v.message}; attempting one-shot repair…`);
       try {
         const repairedContents = await repairProposedFile({
           path: e.path,
           rejectedContents: toWrite,
-          reason,
+          reason: `[${v.rule}] ${v.message}`,
           originalContents: src.content,
           hypothesis: loop.plan?.hypothesis ?? "",
           proposedChange: loop.plan?.proposed_change ?? "",
         });
         if (repairedContents) {
-          const reason2 = sanityCheck(e.path, repairedContents);
-          if (!reason2) {
+          const v2 = validateProposedFile(e.path, repairedContents);
+          if (v2.ok) {
             toWrite = repairedContents;
-            reason = null;
+            v = { ok: true };
             repaired.push(e.path);
             validationNotes.push(`${e.path}: repair passed validation`);
           } else {
-            validationNotes.push(`${e.path}: repair still invalid (${reason2})`);
+            validationNotes.push(`${e.path}: repair still invalid [${v2.rule}] ${v2.message}`);
           }
         } else {
           validationNotes.push(`${e.path}: repair returned no contents`);
@@ -746,7 +746,15 @@ async function runPatch(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
         validationNotes.push(`${e.path}: repair errored (${err instanceof Error ? err.message : String(err)})`);
       }
     }
-    if (reason) { skipped.push(`${e.path}: ${reason}`); continue; }
+    if (!v.ok) { skipped.push(`${e.path}: [${v.rule}] ${v.message}`); continue; }
+    // Belt-and-braces: re-validate immediately before pushing. Repair is the
+    // only path that could change toWrite after the first check, but if a
+    // future refactor adds another mutation we still cannot push junk.
+    const finalCheck = validateProposedFile(e.path, toWrite);
+    if (!finalCheck.ok) {
+      skipped.push(`${e.path}: final-check [${finalCheck.rule}] ${finalCheck.message}`);
+      continue;
+    }
     try {
       await putFile(token, repo.owner, repo.name, {
         path: e.path,

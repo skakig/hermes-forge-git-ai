@@ -468,6 +468,65 @@ const PATCH_CONFIG_FILES = [
 
 const MAX_BUNDLE_CHARS = 40_000;
 
+// Try once to repair an AI edit that failed local validation. We send the
+// rejected file back with the exact validation error and ask for a corrected
+// full-file output. Only used pre-commit; never pushed unless it validates.
+async function repairProposedFile(args: {
+  path: string;
+  rejectedContents: string;
+  reason: string;
+  originalContents: string;
+  hypothesis: string;
+  proposedChange: string;
+}): Promise<string | null> {
+  const ai = await callAI({
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are Hermes. Your previous edit to a file was rejected by a pre-commit validator because the file is not valid JS/TS/JSON. " +
+          "Return the FULL corrected file contents. Make the MINIMUM change needed to make it valid while preserving the intent of the original edit. " +
+          "Never wrap the output in markdown code fences. Never add a preamble. Output must be raw source code only.",
+      },
+      {
+        role: "user",
+        content: [
+          `Path: ${args.path}`,
+          `Validator rejection reason: ${args.reason}`,
+          ``,
+          `Original hypothesis: ${args.hypothesis}`,
+          `Proposed change: ${args.proposedChange}`,
+          ``,
+          `REJECTED CONTENTS (your previous output):`,
+          "```",
+          args.rejectedContents.slice(0, 12000),
+          "```",
+          ``,
+          `ORIGINAL CONTENTS (on branch, before any edit):`,
+          "```",
+          args.originalContents.slice(0, 12000),
+          "```",
+        ].join("\n"),
+      },
+    ],
+    tool: {
+      name: "submit_repaired_file",
+      description: "Return the corrected full contents of the file.",
+      parameters: {
+        type: "object",
+        properties: {
+          new_contents: { type: "string", description: "Complete corrected file contents, raw source only." },
+          note: { type: "string" },
+        },
+        required: ["new_contents"],
+        additionalProperties: false,
+      },
+    },
+  });
+  const t = ai.tool as { new_contents?: string } | null;
+  return t?.new_contents ?? null;
+}
+
 async function runPatch(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
   const { repo, loop } = ctx;
   if (!loop.branch) throw new Error("patch_missing_branch");

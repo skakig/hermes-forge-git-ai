@@ -12,6 +12,8 @@ import {
   addPRComment,
   markPRReadyForReview,
   listPRChecks,
+  collectFailureLogs,
+  type FailureLog,
   type RepoTreeEntry,
 } from "./github-app.server";
 import { supabaseAdmin } from "@/integrations/supabase/client.server";

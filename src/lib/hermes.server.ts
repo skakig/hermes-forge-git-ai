@@ -607,7 +607,7 @@ async function runChecksPending(ctx: PhaseCtx, token: string): Promise<PhasePatc
     started_at: new Date(startedAt).toISOString(),
     last_checked_at: new Date().toISOString(),
     checks: allChecks,
-  };
+  } as unknown as import("@/integrations/supabase/types").Json;
 
   if (succeeded) {
     return {

@@ -265,7 +265,7 @@ async function runPlan(ctx: PhaseCtx): Promise<PhasePatch> {
   if (!planArgs) throw new Error("plan_missing_tool_call");
   const suspect = (planArgs.suspect_files ?? []).filter(Boolean).slice(0, 5);
   return {
-    phase: "draft_pr",
+    phase: "research",
     plan: {
       summary: ctx.loop.plan?.summary,
       hypothesis: planArgs.hypothesis,
@@ -277,6 +277,171 @@ async function runPlan(ctx: PhaseCtx): Promise<PhasePatch> {
     },
     suspect_files: suspect,
     message: `Plan ready · ${planArgs.hypothesis.slice(0, 90)}`,
+    comment_kind: "progress",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Research phase. The agent writes down the authoritative rules / spec /
+// algorithm it intends to implement BEFORE touching code. Two paths:
+//
+//   1. AI-only: ask the model to recall the canonical rules from its training
+//      data, with explicit source citations (URLs / RFCs / book titles).
+//   2. Firecrawl-augmented (when FIRECRAWL_API_KEY is set): use the AI's
+//      search queries, scrape the top results, and feed the markdown back in.
+//
+// The distilled rules become a `research` block on the plan and are injected
+// verbatim into the patch system prompt so the agent codes AGAINST the spec
+// rather than inventing behavior. Falls back to a no-op if AI fails.
+// ---------------------------------------------------------------------------
+
+type ResearchBlock = {
+  queries: string[];
+  sources: Array<{ url: string; title: string; summary: string }>;
+  rules_extracted: string;
+  augmented: boolean;
+};
+
+async function firecrawlSearchAndScrape(query: string): Promise<Array<{ url: string; title: string; markdown: string }>> {
+  const key = process.env.FIRECRAWL_API_KEY;
+  if (!key) return [];
+  try {
+    const res = await fetch("https://api.firecrawl.dev/v2/search", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query,
+        limit: 2,
+        scrapeOptions: { formats: ["markdown"], onlyMainContent: true },
+      }),
+    });
+    if (!res.ok) return [];
+    const json = (await res.json()) as {
+      data?: { web?: Array<{ url: string; title?: string; markdown?: string }> } | Array<{ url: string; title?: string; markdown?: string }>;
+    };
+    const raw = Array.isArray(json.data) ? json.data : json.data?.web ?? [];
+    return raw.slice(0, 2).map((r) => ({
+      url: r.url,
+      title: r.title ?? r.url,
+      markdown: (r.markdown ?? "").slice(0, 4000),
+    }));
+  } catch (e) {
+    console.error("firecrawl search failed:", e);
+    return [];
+  }
+}
+
+async function runResearch(ctx: PhaseCtx): Promise<PhasePatch> {
+  const { loop } = ctx;
+  const plan = loop.plan ?? {};
+  const bug = loop.bug_report?.trim() ?? "";
+  // Ask the AI to produce search queries + an authoritative rules brief from
+  // its own knowledge, with source citations. This is useful even without
+  // Firecrawl because well-known domains (game rules, RFCs, common algorithms)
+  // are in the model's training data.
+  let ai;
+  try {
+    ai = await callAI({
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are Hermes' research analyst. Before any code changes, you produce an AUTHORITATIVE rules brief for the proposed change so the engineer codes against the spec, not against guesses. " +
+            "If the proposed change touches a well-known domain (game rules, protocols, algorithms, accessibility specs, etc.), recall the canonical rules from your training and cite the most authoritative public source URL you know. " +
+            "Also produce 1-3 targeted web search queries someone could run to verify. If the change is purely internal refactor / typing with no external spec, return empty rules and one query.",
+        },
+        {
+          role: "user",
+          content: [
+            `Hypothesis: ${plan.hypothesis ?? "(none)"}`,
+            `Proposed change: ${plan.proposed_change ?? "(none)"}`,
+            bug ? `User bug report: ${bug}` : "",
+            `Repo brief: ${plan.summary ?? "(none)"}`,
+          ].filter(Boolean).join("\n"),
+        },
+      ],
+      tool: {
+        name: "submit_research",
+        description: "Submit a rules brief grounding the proposed change.",
+        parameters: {
+          type: "object",
+          properties: {
+            queries: {
+              type: "array",
+              items: { type: "string" },
+              description: "1-3 web search queries that would verify the rules.",
+            },
+            sources: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  url: { type: "string" },
+                  title: { type: "string" },
+                  summary: { type: "string", description: "One-paragraph summary of what this source says about the rules." },
+                },
+                required: ["url", "title", "summary"],
+                additionalProperties: false,
+              },
+              description: "Up to 3 authoritative source URLs from your training data.",
+            },
+            rules_extracted: {
+              type: "string",
+              description: "The actual rules / spec the engineer must implement, in numbered form. Be specific and conservative. If no external spec applies, write 'No external spec applies.'",
+            },
+          },
+          required: ["queries", "sources", "rules_extracted"],
+          additionalProperties: false,
+        },
+      },
+    });
+  } catch (e) {
+    console.error("research phase AI call failed:", e);
+    return {
+      phase: "draft_pr",
+      message: `Research skipped (${e instanceof Error ? e.message.slice(0, 80) : "AI error"})`,
+      comment_kind: "progress",
+    };
+  }
+  const r = ai.tool as { queries: string[]; sources: Array<{ url: string; title: string; summary: string }>; rules_extracted: string } | null;
+  if (!r) {
+    return { phase: "draft_pr", message: "Research returned no brief; proceeding", comment_kind: "progress" };
+  }
+
+  let augmented = false;
+  const sources = [...(r.sources ?? [])];
+  // Optional Firecrawl augmentation: actually fetch the top query's results
+  // and append a short summary so the patch step has fresh ground truth.
+  if (process.env.FIRECRAWL_API_KEY && (r.queries?.[0]?.length ?? 0) > 3) {
+    const hits = await firecrawlSearchAndScrape(r.queries[0]);
+    if (hits.length) {
+      augmented = true;
+      for (const h of hits) {
+        if (sources.some((s) => s.url === h.url)) continue;
+        sources.push({
+          url: h.url,
+          title: h.title,
+          summary: h.markdown.slice(0, 600).replace(/\s+/g, " ").trim(),
+        });
+      }
+    }
+  }
+
+  const research: ResearchBlock = {
+    queries: (r.queries ?? []).slice(0, 3),
+    sources: sources.slice(0, 5),
+    rules_extracted: r.rules_extracted ?? "",
+    augmented,
+  };
+
+  return {
+    phase: "draft_pr",
+    plan: {
+      ...(loop.plan ?? {}),
+      // @ts-expect-error stored alongside plan for the patch step + UI
+      research,
+    },
+    message: `Research ready · ${research.sources.length} source${research.sources.length === 1 ? "" : "s"}${augmented ? " (web-verified)" : ""}`,
     comment_kind: "progress",
   };
 }

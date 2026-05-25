@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Flame, Loader2, ExternalLink, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -54,16 +54,17 @@ export function LoopControl() {
     (l) => l.status === "running" || l.status === "queued",
   );
 
-  // Poll the active loop more aggressively (drives phase transitions server-side)
+  // Drive phase transitions server-side. Single in-flight call per loop;
+  // the server holds a per-loop lock so duplicates are harmless anyway.
+  const inflight = useRef(false);
   useEffect(() => {
-    if (!activeLoop) return;
-    const id = setInterval(() => {
-      pollFn({ data: { loop_id: activeLoop.id } })
-        .then(() => queryClient.invalidateQueries({ queryKey: ["forge"] }))
-        .catch(() => {});
-    }, 5000);
-    return () => clearInterval(id);
-  }, [activeLoop?.id, pollFn, queryClient]);
+    if (!activeLoop || inflight.current) return;
+    inflight.current = true;
+    pollFn({ data: { loop_id: activeLoop.id } })
+      .then(() => queryClient.invalidateQueries({ queryKey: ["forge"] }))
+      .catch(() => {})
+      .finally(() => { inflight.current = false; });
+  }, [activeLoop?.id, activeLoop?.phase, pollFn, queryClient]);
 
   const startMutation = useMutation({
     mutationFn: (args: { repository_id: string; bug_report?: string }) => startFn({ data: args }),

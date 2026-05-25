@@ -621,7 +621,12 @@ async function runChecksPending(ctx: PhaseCtx, token: string): Promise<PhasePatc
     head_sha: headSha,
     started_at: new Date(startedAt).toISOString(),
     last_checked_at: new Date().toISOString(),
-    checks: allChecks.map(({ kind: _k, check_run_id: _id, ...rest }) => rest),
+    checks: allChecks.map((c) => ({
+      name: c.name,
+      state: c.state,
+      url: c.url,
+      summary: c.summary,
+    })),
     failure_logs: failureLogs,
   } as unknown as import("@/integrations/supabase/types").Json;
 

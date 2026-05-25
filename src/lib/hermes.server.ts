@@ -153,6 +153,8 @@ export async function runPhase(ctx: PhaseCtx): Promise<PhasePatch> {
       return runAudit(ctx, token);
     case "plan":
       return runPlan(ctx);
+    case "research":
+      return runResearch(ctx);
     case "draft_pr":
       return runDraftPr(ctx, token);
     case "patch":

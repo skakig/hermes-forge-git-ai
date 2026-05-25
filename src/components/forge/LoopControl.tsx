@@ -31,6 +31,63 @@ const phaseLabels: Record<string, string> = {
   canceled: "Canceled",
 };
 
+type CheckItem = { name: string; state: string; url: string | null; summary: string | null };
+
+function checkTone(state: string): string {
+  if (["success", "completed"].includes(state)) return "text-emerald-400";
+  if (["failure", "error", "timed_out", "action_required", "cancelled"].includes(state)) return "text-red-400";
+  if (["pending", "queued", "in_progress"].includes(state)) return "text-amber-300";
+  return "text-muted-foreground";
+}
+
+function CheckRunList({
+  loop,
+}: {
+  loop: {
+    attempt_count?: number | null;
+    max_attempts?: number | null;
+    checks_status?: string | null;
+    checks_payload?: unknown;
+    last_error?: string | null;
+  };
+}) {
+  const payload = (loop.checks_payload ?? {}) as { checks?: CheckItem[] };
+  const checks = payload.checks ?? [];
+  if (!loop.checks_status && checks.length === 0 && !loop.last_error) return null;
+  const attempts = loop.attempt_count ?? 0;
+  const max = loop.max_attempts ?? 3;
+  return (
+    <div className="relative mt-4 rounded-lg border border-border/60 bg-background/40 p-3">
+      <div className="flex items-center justify-between text-xs uppercase tracking-wider text-muted-foreground">
+        <span>CI checks {loop.checks_status ? `· ${loop.checks_status}` : ""}</span>
+        <span className="font-mono">repair {attempts}/{max}</span>
+      </div>
+      {checks.length > 0 ? (
+        <ul className="mt-2 grid gap-1 max-h-40 overflow-auto pr-1">
+          {checks.map((c, i) => (
+            <li key={`${c.name}-${i}`} className="flex items-center justify-between gap-2 text-xs">
+              <span className="truncate">
+                <span className={`font-mono uppercase mr-2 ${checkTone(c.state)}`}>{c.state}</span>
+                <span className="text-foreground">{c.name}</span>
+              </span>
+              {c.url ? (
+                <a href={c.url} target="_blank" rel="noreferrer" className="text-primary inline-flex items-center gap-1 hover:underline shrink-0">
+                  logs <ExternalLink className="size-3" />
+                </a>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {loop.last_error ? (
+        <div className="mt-2 text-xs text-red-300/90 font-mono whitespace-pre-wrap break-words">
+          {loop.last_error}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export function LoopControl() {
   const queryClient = useQueryClient();
   const fetchRepos = useServerFn(listConnectedRepos);
@@ -222,24 +279,28 @@ export function LoopControl() {
               View draft PR #{activeLoop.pr_number} <ExternalLink className="size-3" />
             </a>
           ) : null}
+          <CheckRunList loop={activeLoop!} />
         </div>
       )}
       {!running && lastFailed ? (
-        <div className="relative mt-6 flex items-center justify-between gap-4 rounded-lg border border-amber-500/30 bg-amber-500/5 p-4">
-          <div className="text-sm text-amber-200/90">
-            Last loop ended in <span className="font-mono uppercase">{lastFailed.phase}</span>.
-            {lastFailed.pr_url ? (
-              <> <a href={lastFailed.pr_url} target="_blank" rel="noreferrer" className="underline">View PR #{lastFailed.pr_number}</a>.</>
-            ) : null}
+        <div className="relative mt-6 rounded-lg border border-amber-500/30 bg-amber-500/5 p-4">
+          <div className="flex items-center justify-between gap-4">
+            <div className="text-sm text-amber-200/90">
+              Last loop ended in <span className="font-mono uppercase">{lastFailed.phase}</span>.
+              {lastFailed.pr_url ? (
+                <> <a href={lastFailed.pr_url} target="_blank" rel="noreferrer" className="underline">View PR #{lastFailed.pr_number}</a>.</>
+              ) : null}
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => resumeMutation.mutate(lastFailed.id)}
+              disabled={resumeMutation.isPending}
+            >
+              Resume / retry repair
+            </Button>
           </div>
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() => resumeMutation.mutate(lastFailed.id)}
-            disabled={resumeMutation.isPending}
-          >
-            Resume / retry repair
-          </Button>
+          <CheckRunList loop={lastFailed} />
         </div>
       ) : null}
     </div>

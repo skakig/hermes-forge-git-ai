@@ -163,7 +163,7 @@ export const listLoops = createServerFn({ method: "GET" })
   .handler(async ({ context }) => {
     const { data, error } = await context.supabase
       .from("loops")
-      .select("id, status, phase, branch, pr_url, pr_number, started_at, finished_at, repository_id, goals, bug_report, plan, suspect_files, pr_is_draft")
+      .select("id, status, phase, branch, pr_url, pr_number, started_at, finished_at, repository_id, goals, bug_report, plan, suspect_files, pr_is_draft, attempt_count, max_attempts, last_error, checks_status, checks_payload")
       .order("started_at", { ascending: false })
       .limit(20);
     if (error) throw new Error(error.message);

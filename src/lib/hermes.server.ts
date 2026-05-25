@@ -996,6 +996,10 @@ async function runDiagnoseFailure(ctx: PhaseCtx, token: string): Promise<PhasePa
     ? failureLogs.map((f) => `### ${f.name}\n${f.log || "(no log)"}`).join("\n\n").slice(0, 8000)
     : failed.map((f) => `- ${f.name} (${f.state})${f.summary ? `: ${f.summary.slice(0, 240)}` : ""}`).join("\n");
 
+  // Pull explicit file:line:col references out of the build logs. These are
+  // deterministic hints that the AI's free-text plan must respect.
+  const extracted = extractErrorLocations(logDigest);
+
   // Read the files we touched last attempt + key build configs so the
   // model can reason about WHY the change broke the build.
   const fileBlocks: string[] = [];
@@ -1028,10 +1032,13 @@ async function runDiagnoseFailure(ctx: PhaseCtx, token: string): Promise<PhasePa
           `Original hypothesis: ${loop.plan?.hypothesis ?? "(none)"}`,
           `Original proposed change: ${loop.plan?.proposed_change ?? "(none)"}`,
           `Previously touched files:\n${(loop.suspect_files ?? []).map((f) => `- ${f}`).join("\n") || "(none)"}`,
+          extracted.length
+            ? `\nEXPLICIT FILE:LINE ERRORS PARSED FROM LOGS (treat as ground truth):\n${extracted.map((e) => `- ${e.path}:${e.line}:${e.col} — ${e.message}`).join("\n")}`
+            : "",
           ``,
           `FAILING CHECKS / BUILD LOGS:\n${logDigest || "(no detail available)"}`,
           fileBlocks.length ? `\nCURRENT FILES ON BRANCH:\n${fileBlocks.join("\n\n")}` : "",
-        ].join("\n"),
+        ].filter(Boolean).join("\n"),
       },
     ],
     tool: {
@@ -1057,7 +1064,12 @@ async function runDiagnoseFailure(ctx: PhaseCtx, token: string): Promise<PhasePa
     | { diagnosis: string; suspect_files: string[]; proposed_fix: string }
     | null;
   if (!repair) throw new Error("diagnose_missing_tool_call");
-  const suspect = (repair.suspect_files ?? []).filter(Boolean).slice(0, 5);
+  // Always include files the build log explicitly named, even if the AI
+  // forgot them. Deterministic hints beat AI inference.
+  const aiSuspects = (repair.suspect_files ?? []).filter(Boolean);
+  const explicit = extracted.map((e) => e.path);
+  const mergedSet = new Set<string>([...explicit, ...aiSuspects]);
+  const suspect = Array.from(mergedSet).slice(0, 5);
   const attempts = (loop.attempt_count ?? 0) + 1;
   return {
     phase: "repair_patch",
@@ -1068,10 +1080,43 @@ async function runDiagnoseFailure(ctx: PhaseCtx, token: string): Promise<PhasePa
       hypothesis: repair.diagnosis,
       proposed_change: repair.proposed_fix,
       suspect_files: suspect,
+      // @ts-expect-error informational only — surfaced in UI
+      build_errors: extracted.slice(0, 10),
     },
     message: `Diagnosis · ${repair.diagnosis.slice(0, 120)}`,
     comment_kind: "progress",
   };
+}
+
+// Extract file:line:col error references from raw build logs.
+// Handles esbuild ("/path/to/file.ts:1:2: ERROR: ..."), tsc
+// ("path/to/file.ts(12,5): error TSxxxx"), and Vite variants.
+function extractErrorLocations(log: string): Array<{ path: string; line: number; col: number; message: string }> {
+  if (!log) return [];
+  const out: Array<{ path: string; line: number; col: number; message: string }> = [];
+  const seen = new Set<string>();
+  // esbuild / vite: /abs/or/rel/path.ts:LINE:COL: ERROR: message
+  const esbuild = /(?:^|\s)((?:\/opt\/build\/repo\/)?(?:src|app|lib|pages|components|hooks|utils|server|routes)[^\s:()]*\.(?:tsx?|jsx?|mjs|cjs|json|toml|yaml|yml)):(\d+):(\d+)(?::\s*(?:ERROR|error|Error):?\s*([^\n]+))?/g;
+  let m: RegExpExecArray | null;
+  while ((m = esbuild.exec(log)) !== null) {
+    const path = m[1].replace(/^\/opt\/build\/repo\//, "");
+    const line = Number(m[2]);
+    const col = Number(m[3]);
+    const message = (m[4] ?? "").trim().slice(0, 240);
+    const key = `${path}:${line}:${col}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ path, line, col, message });
+  }
+  // tsc style: path/to/file.ts(12,5): error TSxxxx: message
+  const tsc = /((?:src|app|lib|pages|components|hooks|utils|server|routes)[^\s:()]*\.(?:tsx?|jsx?)):?\((\d+),(\d+)\):\s*error\s+TS\d+:\s*([^\n]+)/g;
+  while ((m = tsc.exec(log)) !== null) {
+    const key = `${m[1]}:${m[2]}:${m[3]}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ path: m[1], line: Number(m[2]), col: Number(m[3]), message: m[4].trim().slice(0, 240) });
+  }
+  return out.slice(0, 10);
 }
 
 // ---------------------------------------------------------------------------

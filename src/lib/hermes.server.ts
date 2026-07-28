@@ -1158,7 +1158,165 @@ async function runCommit(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
       /* non-fatal */
     }
   }
-  return { phase: "ready", message: "Commits pushed; preparing PR for review", comment_kind: "progress" };
+  return { phase: "verify", message: "Commits pushed; verifying spec compliance", comment_kind: "progress" };
+}
+
+// ---------------------------------------------------------------------------
+// Verify phase: does the diff actually satisfy the rules brief?
+//
+// Reads the final contents of every touched file from the PR branch and asks
+// the model, using the research brief (if any) as ground truth, whether the
+// change implements each rule. If any rule is unimplemented, the loop bounces
+// back to `patch` with the rule-gap message as failure logs, up to the
+// existing `max_attempts` budget. Otherwise it advances to `ready`.
+// ---------------------------------------------------------------------------
+
+async function runVerify(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
+  const { loop, repo } = ctx;
+  if (!loop.branch) {
+    return { phase: "ready", message: "No branch to verify; skipping", comment_kind: "progress" };
+  }
+  const research = (loop.plan as { research?: ResearchBlock } | null)?.research;
+  const rules = research?.rules_extracted?.trim() ?? "";
+  // No authoritative rules brief → nothing to verify against. Skip cleanly.
+  if (!rules || rules === "No external spec applies.") {
+    return { phase: "ready", message: "No spec to verify against; proceeding to review", comment_kind: "progress" };
+  }
+
+  const files = (loop.suspect_files ?? []).slice(0, 5);
+  const fileBlocks: string[] = [];
+  for (const p of files) {
+    try {
+      const got = await getFileContents(token, repo.owner, repo.name, p, loop.branch);
+      if (got?.content) fileBlocks.push(`### ${p}\n\`\`\`\n${got.content.slice(0, 6000)}\n\`\`\``);
+    } catch { /* deleted or missing — non-fatal */ }
+  }
+  if (fileBlocks.length === 0) {
+    return { phase: "ready", message: "No files to verify; proceeding to review", comment_kind: "progress" };
+  }
+
+  let ai;
+  try {
+    ai = await callAI({
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are Hermes' spec auditor. You are given (1) an authoritative rules brief and (2) the final contents of the files changed in the current PR branch. Decide, rule by rule, whether the code as it now stands implements that rule. Be strict: half-fixes count as GAP, not PASS. If a rule references validation, scoring, or bust/failure conditions and the code doesn't perform that validation, that's a GAP. Return a machine-readable audit.",
+        },
+        {
+          role: "user",
+          content: [
+            `AUTHORITATIVE RULES BRIEF:`,
+            rules,
+            ``,
+            `PR hypothesis: ${loop.plan?.hypothesis ?? "(none)"}`,
+            `PR proposed change: ${loop.plan?.proposed_change ?? "(none)"}`,
+            ``,
+            `FINAL FILE CONTENTS ON PR BRANCH (${loop.branch}):`,
+            fileBlocks.join("\n\n"),
+          ].join("\n"),
+        },
+      ],
+      tool: {
+        name: "submit_verification",
+        description: "Report whether the diff implements each rule in the brief.",
+        parameters: {
+          type: "object",
+          properties: {
+            gaps: {
+              type: "array",
+              description: "One entry per rule the code does NOT fully implement. Empty array means the diff is spec-complete.",
+              items: {
+                type: "object",
+                properties: {
+                  rule: { type: "string", description: "Verbatim rule text from the brief (or a paraphrase if numbered)." },
+                  evidence: { type: "string", description: "Why the current code doesn't satisfy it — cite the file/function." },
+                  suggested_fix: { type: "string", description: "One-sentence fix suggestion." },
+                },
+                required: ["rule", "evidence", "suggested_fix"],
+                additionalProperties: false,
+              },
+            },
+            summary: { type: "string", description: "One-sentence overall verdict." },
+          },
+          required: ["gaps", "summary"],
+          additionalProperties: false,
+        },
+      },
+    });
+  } catch (e) {
+    console.error("verify phase AI call failed:", e);
+    return { phase: "ready", message: `Verify skipped (${e instanceof Error ? e.message.slice(0, 80) : "AI error"})`, comment_kind: "progress" };
+  }
+  const v = ai.tool as {
+    gaps: Array<{ rule: string; evidence: string; suggested_fix: string }>;
+    summary: string;
+  } | null;
+  if (!v) {
+    return { phase: "ready", message: "Verify returned no audit; proceeding", comment_kind: "progress" };
+  }
+
+  if (v.gaps.length === 0) {
+    return {
+      phase: "ready",
+      plan: { ...(loop.plan ?? {}), /* @ts-expect-error stored alongside plan for UI */ verify: { summary: v.summary, gaps: [] } },
+      message: `Verify passed · ${v.summary.slice(0, 120)}`,
+      comment_kind: "progress",
+    };
+  }
+
+  // Gaps exist → decide whether to bounce back to patch or block.
+  const attempts = loop.attempt_count ?? 0;
+  const max = loop.max_attempts ?? 3;
+  const gapDigest = v.gaps
+    .map((g, i) => `${i + 1}. ${g.rule}\n   evidence: ${g.evidence}\n   suggested fix: ${g.suggested_fix}`)
+    .join("\n\n");
+
+  // Post the gap list on the PR so the human reviewer sees it too.
+  if (loop.pr_number) {
+    try {
+      await addPRComment(
+        token,
+        repo.owner,
+        repo.name,
+        loop.pr_number,
+        `**Hermes spec verification — ${v.gaps.length} gap${v.gaps.length === 1 ? "" : "s"}**\n\n${v.summary}\n\n${gapDigest}`,
+      );
+    } catch { /* non-fatal */ }
+  }
+
+  if (attempts >= max) {
+    return {
+      status: "failed",
+      phase: "blocked",
+      plan: { ...(loop.plan ?? {}), /* @ts-expect-error stored alongside plan for UI */ verify: { summary: v.summary, gaps: v.gaps } },
+      last_error: `Spec verification found ${v.gaps.length} unimplemented rule${v.gaps.length === 1 ? "" : "s"} after ${attempts} attempts.`,
+      finished_at: new Date().toISOString(),
+      message: `Verify failed after ${attempts} attempt${attempts === 1 ? "" : "s"} · ${v.gaps.length} rule gap${v.gaps.length === 1 ? "" : "s"}`,
+      comment_kind: "error",
+    };
+  }
+
+  // Bounce back to patch. Reuse the checks_payload channel so runPatch's
+  // failureDigest picks up the rule gaps as if they were CI errors.
+  const syntheticLogs: FailureLog[] = [
+    {
+      name: "hermes-spec-verify",
+      state: "failure",
+      url: null,
+      log: `Spec verification found ${v.gaps.length} gap${v.gaps.length === 1 ? "" : "s"}:\n\n${gapDigest}`,
+    },
+  ];
+  return {
+    phase: "patch",
+    attempt_count: attempts + 1,
+    checks_status: "spec_gap",
+    checks_payload: { failure_logs: syntheticLogs, verify_gaps: v.gaps, verify_summary: v.summary } as unknown as import("@/integrations/supabase/types").Json,
+    plan: { ...(loop.plan ?? {}), /* @ts-expect-error stored alongside plan for UI */ verify: { summary: v.summary, gaps: v.gaps } },
+    message: `Verify found ${v.gaps.length} spec gap${v.gaps.length === 1 ? "" : "s"} · repatching (${attempts + 1}/${max})`,
+    comment_kind: "progress",
+  };
 }
 
 async function runReady(ctx: PhaseCtx, token: string): Promise<PhasePatch> {

@@ -1464,25 +1464,56 @@ async function runChecksPending(ctx: PhaseCtx, token: string): Promise<PhasePatc
   if (failed.length > 0) {
     const attempts = ctx.loop.attempt_count ?? 0;
     const max = ctx.loop.max_attempts ?? 3;
-    // Reconciliation: before we declare failure, ask GitHub whether the PR
-    // was actually merged anyway (auto-merge or human merge despite failing
-    // checks). If so, the loop is effectively complete and should NOT show
-    // as ERROR in the dashboard.
+    // Reconciliation: check PR state on every failing-checks tick before
+    // deciding whether to repair or terminate. A merged PR is success even
+    // if checks failed; a closed-without-merge PR is the only truly rejected
+    // outcome; a 404 means the PR is gone.
+    let prState: { state: string; merged: boolean } | null = null;
+    let prMissing = false;
     try {
-      const prState = await getPRState(token, repo.owner, repo.name, loop.pr_number);
-      if (prState.merged) {
-        return {
-          status: "completed",
-          phase: "completed",
-          checks_status: "merged_with_failures",
-          checks_payload: payload,
-          finished_at: new Date().toISOString(),
-          message: `PR #${loop.pr_number} was merged despite ${failed.length} failing check${failed.length === 1 ? "" : "s"} · review recommended`,
-          comment_kind: "completed",
-        };
-      }
+      prState = await getPRState(token, repo.owner, repo.name, loop.pr_number);
     } catch (e) {
-      console.error("getPRState failed during checks reconciliation:", e);
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/\b404\b/.test(msg)) {
+        prMissing = true;
+      } else {
+        console.error("getPRState failed during checks reconciliation:", e);
+      }
+    }
+    if (prState?.merged) {
+      return {
+        status: "completed",
+        phase: "completed",
+        checks_status: "merged_with_failures",
+        checks_payload: payload,
+        finished_at: new Date().toISOString(),
+        message: `PR #${loop.pr_number} was merged despite ${failed.length} failing check${failed.length === 1 ? "" : "s"} · review recommended`,
+        comment_kind: "completed",
+      };
+    }
+    if (prMissing) {
+      return {
+        status: "failed",
+        phase: "blocked",
+        checks_status: "pr_missing",
+        checks_payload: payload,
+        last_error: `PR #${loop.pr_number} no longer exists on GitHub`,
+        finished_at: new Date().toISOString(),
+        message: `PR #${loop.pr_number} not found · marking blocked`,
+        comment_kind: "error",
+      };
+    }
+    if (prState && prState.state === "closed" && !prState.merged) {
+      return {
+        status: "failed",
+        phase: "blocked",
+        checks_status: "pr_closed",
+        checks_payload: payload,
+        last_error: `PR #${loop.pr_number} was closed without merging`,
+        finished_at: new Date().toISOString(),
+        message: `PR #${loop.pr_number} closed without merging · marking blocked`,
+        comment_kind: "error",
+      };
     }
     if (attempts >= max) {
       return {

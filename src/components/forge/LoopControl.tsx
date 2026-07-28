@@ -14,7 +14,7 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 
-const phaseOrder = ["audit", "plan", "research", "draft_pr", "patch", "commit", "ready", "checks_pending", "completed"];
+const phaseOrder = ["audit", "plan", "research", "draft_pr", "patch", "commit", "verify", "ready", "checks_pending", "completed"];
 const phaseLabels: Record<string, string> = {
   audit: "Auditing source tree",
   plan: "Forming a plan",
@@ -22,6 +22,7 @@ const phaseLabels: Record<string, string> = {
   draft_pr: "Opening draft PR",
   patch: "Editing files",
   commit: "Pushing commits",
+  verify: "Verifying spec compliance",
   ready: "Flipping to ready for review",
   checks_pending: "Waiting on CI checks",
   diagnose_failure: "Diagnosing failed checks",

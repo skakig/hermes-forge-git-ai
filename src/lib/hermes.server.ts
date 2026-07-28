@@ -152,7 +152,7 @@ export async function runPhase(ctx: PhaseCtx): Promise<PhasePatch> {
     case "audit":
       return runAudit(ctx, token);
     case "plan":
-      return runPlan(ctx);
+      return runPlan(ctx, token);
     case "research":
       return runResearch(ctx);
     case "draft_pr":
@@ -161,6 +161,8 @@ export async function runPhase(ctx: PhaseCtx): Promise<PhasePatch> {
       return runPatch(ctx, token);
     case "commit":
       return runCommit(ctx, token);
+    case "verify":
+      return runVerify(ctx, token);
     case "ready":
       return runReady(ctx, token);
     case "checks_pending":

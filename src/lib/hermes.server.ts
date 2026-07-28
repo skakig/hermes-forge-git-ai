@@ -1258,9 +1258,10 @@ async function runVerify(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
   }
 
   if (v.gaps.length === 0) {
+    const nextPlan = { ...(loop.plan ?? {}), verify: { summary: v.summary, gaps: [] as Array<{ rule: string; evidence: string; suggested_fix: string }> } } as unknown as LoopRow["plan"];
     return {
       phase: "ready",
-      plan: { ...(loop.plan ?? {}), /* @ts-expect-error stored alongside plan for UI */ verify: { summary: v.summary, gaps: [] } },
+      plan: nextPlan,
       message: `Verify passed · ${v.summary.slice(0, 120)}`,
       comment_kind: "progress",
     };
@@ -1287,10 +1288,11 @@ async function runVerify(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
   }
 
   if (attempts >= max) {
+    const blockedPlan = { ...(loop.plan ?? {}), verify: { summary: v.summary, gaps: v.gaps } } as unknown as LoopRow["plan"];
     return {
       status: "failed",
       phase: "blocked",
-      plan: { ...(loop.plan ?? {}), /* @ts-expect-error stored alongside plan for UI */ verify: { summary: v.summary, gaps: v.gaps } },
+      plan: blockedPlan,
       last_error: `Spec verification found ${v.gaps.length} unimplemented rule${v.gaps.length === 1 ? "" : "s"} after ${attempts} attempts.`,
       finished_at: new Date().toISOString(),
       message: `Verify failed after ${attempts} attempt${attempts === 1 ? "" : "s"} · ${v.gaps.length} rule gap${v.gaps.length === 1 ? "" : "s"}`,
@@ -1303,17 +1305,18 @@ async function runVerify(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
   const syntheticLogs: FailureLog[] = [
     {
       name: "hermes-spec-verify",
-      state: "failure",
+      kind: "check_run",
       url: null,
       log: `Spec verification found ${v.gaps.length} gap${v.gaps.length === 1 ? "" : "s"}:\n\n${gapDigest}`,
     },
   ];
+  const patchPlan = { ...(loop.plan ?? {}), verify: { summary: v.summary, gaps: v.gaps } } as unknown as LoopRow["plan"];
   return {
     phase: "patch",
     attempt_count: attempts + 1,
     checks_status: "spec_gap",
     checks_payload: { failure_logs: syntheticLogs, verify_gaps: v.gaps, verify_summary: v.summary } as unknown as import("@/integrations/supabase/types").Json,
-    plan: { ...(loop.plan ?? {}), /* @ts-expect-error stored alongside plan for UI */ verify: { summary: v.summary, gaps: v.gaps } },
+    plan: patchPlan,
     message: `Verify found ${v.gaps.length} spec gap${v.gaps.length === 1 ? "" : "s"} · repatching (${attempts + 1}/${max})`,
     comment_kind: "progress",
   };

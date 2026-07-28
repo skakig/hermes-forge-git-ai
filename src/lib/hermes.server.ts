@@ -219,15 +219,87 @@ async function runAudit(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
   };
 }
 
-async function runPlan(ctx: PhaseCtx): Promise<PhasePatch> {
+// Extract meaningful keywords from a bug report — nouns/terms ≥ 4 chars that
+// aren't in a small English stopword list. Deterministic; used to grep the
+// repo tree for candidate files that mention the buggy concept even if their
+// filenames don't advertise it.
+const STOPWORDS = new Set([
+  "the","and","for","with","this","that","from","have","when","then","have",
+  "them","they","their","your","just","some","been","were","will","would","should",
+  "could","into","also","only","because","which","what","where","there","here",
+  "about","after","before","between","during","under","over","above","below","again",
+  "very","much","more","less","most","many","much","such","than","them","these",
+  "those","this","those","being","doesn","doesnt","dont","cant","cannot","null",
+  "true","false","none","function","class","file","code","line","error","issue",
+  "problem","actually","game","play","player","user","users","using","used","need",
+  "make","made","take","taken","seems","looks","look","looking","fix","fixed",
+  "still","again","every","each","when","case","cases","rule","rules","logic",
+]);
+
+function extractKeywords(text: string, max = 12): string[] {
+  const tokens = text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .split(/\s+/)
+    .filter((t) => t.length >= 4 && !STOPWORDS.has(t));
+  // Frequency-weight, prefer distinctive terms.
+  const freq = new Map<string, number>();
+  for (const t of tokens) freq.set(t, (freq.get(t) ?? 0) + 1);
+  return [...freq.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, max)
+    .map(([t]) => t);
+}
+
+// Rank source files by how well their PATH matches bug-report keywords.
+// (Content-grep would be more accurate but costs one API call per file; the
+// path signal is deterministic and cheap, and combined with the AI's own
+// filename-based intuition it materially widens candidate scope.)
+function discoverCandidateFiles(files: RepoTreeEntry[], bugReport: string): string[] {
+  const keywords = extractKeywords(bugReport);
+  if (keywords.length === 0) return [];
+  type Scored = { path: string; score: number };
+  const scored: Scored[] = [];
+  for (const f of files) {
+    const p = f.path.toLowerCase();
+    let score = 0;
+    for (const k of keywords) {
+      if (p.includes(k)) score += k.length >= 6 ? 3 : 2;
+    }
+    // Bonus for likely business-logic locations.
+    if (/(logic|rules|validate|validation|score|scoring|engine|state|reducer)/.test(p)) score += 1;
+    // Penalty for tests/mocks/stories.
+    if (/(\.test\.|\.spec\.|__tests__|__mocks__|\.stories\.)/.test(p)) score -= 2;
+    if (score > 0) scored.push({ path: f.path, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, 8).map((s) => s.path);
+}
+
+async function runPlan(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
   const goals = ctx.loop.goals.length ? ctx.loop.goals.join("\n- ") : "Improve overall code quality.";
   const bug = ctx.loop.bug_report?.trim();
+  const { repo } = ctx;
+
+  // Deterministic candidate discovery from the bug report BEFORE asking the AI.
+  let candidatePaths: string[] = [];
+  if (bug) {
+    try {
+      const tree = await listRepoTree(token, repo.owner, repo.name, repo.default_branch);
+      const files = filterSourceFiles(tree.tree);
+      candidatePaths = discoverCandidateFiles(files, bug);
+    } catch (e) {
+      console.error("candidate discovery failed:", e);
+    }
+  }
+
+  // Stage 1: initial hypothesis + candidate file list from the AI.
   const ai = await callAI({
     messages: [
       {
         role: "system",
         content:
-          "You are Hermes. Given a repo brief, a user bug report, and active goals, propose ONE focused improvement that can ship in a small pull request. Identify the most likely suspect files (max 5) by path. Be concrete about the change.",
+          "You are Hermes. Given a repo brief, a user bug report, active goals, and a keyword-derived candidate file list, propose ONE focused improvement that can ship in a small pull request. Identify the most likely suspect files (max 5) by path — you may pick from the candidate list, from the repo brief, or from your own inference, and you SHOULD prefer paths that plausibly contain the business logic named in the bug report (e.g. scoring, validation, rules), not just UI/state hooks. Be concrete about the change.",
       },
       {
         role: "user",
@@ -237,6 +309,9 @@ async function runPlan(ctx: PhaseCtx): Promise<PhasePatch> {
           `Active goals:\n- ${goals}`,
           ``,
           bug ? `Bug report / instructions from the user:\n${bug}` : `(no specific bug report; investigate the goals)`,
+          candidatePaths.length
+            ? `\nCandidate files (paths matching keywords in the bug report — inspect before finalizing scope):\n${candidatePaths.map((p) => `- ${p}`).join("\n")}`
+            : "",
         ].join("\n"),
       },
     ],
@@ -265,7 +340,67 @@ async function runPlan(ctx: PhaseCtx): Promise<PhasePatch> {
     | { hypothesis: string; suspect_files: string[]; proposed_change: string; risk: string; pr_title: string }
     | null;
   if (!planArgs) throw new Error("plan_missing_tool_call");
-  const suspect = (planArgs.suspect_files ?? []).filter(Boolean).slice(0, 5);
+  let suspect = (planArgs.suspect_files ?? []).filter(Boolean).slice(0, 5);
+
+  // Stage 2: read the actual contents of the top 3 candidate files, then let
+  // the model refine the suspect list. This is the "read code before locking
+  // scope" step — it's what fixes the Farkle-style half-fix where the plan
+  // picked useGameState.ts but missed the scoring validator.
+  const toInspect = Array.from(new Set([...suspect, ...candidatePaths])).slice(0, 4);
+  const fileBlocks: string[] = [];
+  for (const p of toInspect) {
+    try {
+      const got = await getFileContents(token, repo.owner, repo.name, p, repo.default_branch);
+      if (got?.content) fileBlocks.push(`### ${p}\n\`\`\`\n${got.content.slice(0, 4000)}\n\`\`\``);
+    } catch { /* file may not exist on default branch */ }
+  }
+  if (fileBlocks.length > 0) {
+    try {
+      const refine = await callAI({
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are Hermes. You proposed an initial plan and now have the actual contents of the most likely candidate files. Refine the suspect_files list (max 5) to include EVERY file whose code must change to implement the proposed change end-to-end. If the bug is about validation/rules/scoring logic and you see that logic in one file but not in your current suspect list, ADD IT. If a file in your current list doesn't actually contain the relevant code, REPLACE it. Return a concise, updated plan.",
+          },
+          {
+            role: "user",
+            content: [
+              `Bug report: ${bug ?? "(none)"}`,
+              `Current hypothesis: ${planArgs.hypothesis}`,
+              `Current proposed change: ${planArgs.proposed_change}`,
+              `Current suspect_files: ${suspect.join(", ") || "(none)"}`,
+              ``,
+              `FILES READ (from default branch):`,
+              fileBlocks.join("\n\n"),
+            ].join("\n"),
+          },
+        ],
+        tool: {
+          name: "refine_plan",
+          description: "Return a refined suspect_files list and (optionally) an updated proposed_change.",
+          parameters: {
+            type: "object",
+            properties: {
+              suspect_files: { type: "array", items: { type: "string" }, description: "Final list of files to edit (max 5)." },
+              proposed_change: { type: "string", description: "Refined proposed change (may be unchanged)." },
+              rationale: { type: "string", description: "One sentence: why this set of files, not the previous one." },
+            },
+            required: ["suspect_files", "proposed_change", "rationale"],
+            additionalProperties: false,
+          },
+        },
+      });
+      const r = refine.tool as { suspect_files?: string[]; proposed_change?: string; rationale?: string } | null;
+      if (r?.suspect_files?.length) {
+        suspect = r.suspect_files.filter(Boolean).slice(0, 5);
+        if (r.proposed_change) planArgs.proposed_change = r.proposed_change;
+      }
+    } catch (e) {
+      console.error("plan refinement failed (non-fatal):", e);
+    }
+  }
+
   return {
     phase: "research",
     plan: {
@@ -276,6 +411,8 @@ async function runPlan(ctx: PhaseCtx): Promise<PhasePatch> {
       risk: planArgs.risk,
       // @ts-expect-error stored alongside plan for later use
       pr_title: planArgs.pr_title,
+      // @ts-expect-error informational only — surfaced in UI
+      candidate_paths: candidatePaths,
     },
     suspect_files: suspect,
     message: `Plan ready · ${planArgs.hypothesis.slice(0, 90)}`,

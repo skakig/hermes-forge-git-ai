@@ -411,7 +411,6 @@ async function runPlan(ctx: PhaseCtx, token: string): Promise<PhasePatch> {
       risk: planArgs.risk,
       // @ts-expect-error stored alongside plan for later use
       pr_title: planArgs.pr_title,
-      // @ts-expect-error informational only — surfaced in UI
       candidate_paths: candidatePaths,
     },
     suspect_files: suspect,

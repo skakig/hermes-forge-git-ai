@@ -303,7 +303,6 @@ type ResearchBlock = {
 };
 
 async function firecrawlSearchAndScrape(query: string): Promise<Array<{ url: string; title: string; markdown: string }>> {
-async function firecrawlSearchAndScrape(query: string): Promise<Array<{ url: string; title: string; markdown: string }>> {
   const lovableKey = process.env.LOVABLE_API_KEY;
   const firecrawlKey = process.env.FIRECRAWL_API_KEY;
   if (!lovableKey || !firecrawlKey) return [];

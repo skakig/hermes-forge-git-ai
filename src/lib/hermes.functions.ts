@@ -169,3 +169,13 @@ export const listLoops = createServerFn({ method: "GET" })
     if (error) throw new Error(error.message);
     return { loops: data ?? [] };
   });
+
+// Reports which optional research capabilities are wired up so the UI can
+// nudge the user to connect Firecrawl for web-verified rules briefs.
+export const getHermesCapabilities = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async () => {
+    return {
+      firecrawl: !!process.env.FIRECRAWL_API_KEY && !!process.env.LOVABLE_API_KEY,
+    };
+  });

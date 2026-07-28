@@ -303,24 +303,36 @@ type ResearchBlock = {
 };
 
 async function firecrawlSearchAndScrape(query: string): Promise<Array<{ url: string; title: string; markdown: string }>> {
-  const key = process.env.FIRECRAWL_API_KEY;
-  if (!key) return [];
+  const lovableKey = process.env.LOVABLE_API_KEY;
+  const firecrawlKey = process.env.FIRECRAWL_API_KEY;
+  if (!lovableKey || !firecrawlKey) return [];
   try {
-    const res = await fetch("https://api.firecrawl.dev/v2/search", {
+    // Firecrawl is a gateway-backed connector — route through the Lovable
+    // gateway so OAuth/token refresh is handled for us.
+    const res = await fetch("https://connector-gateway.lovable.dev/firecrawl/v2/search", {
       method: "POST",
-      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      headers: {
+        Authorization: `Bearer ${lovableKey}`,
+        "X-Connection-Api-Key": firecrawlKey,
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({
         query,
-        limit: 2,
+        limit: 3,
         scrapeOptions: { formats: ["markdown"], onlyMainContent: true },
       }),
     });
-    if (!res.ok) return [];
+    if (!res.ok) {
+      console.error("firecrawl gateway error:", res.status, (await res.text().catch(() => "")).slice(0, 300));
+      return [];
+    }
     const json = (await res.json()) as {
-      data?: { web?: Array<{ url: string; title?: string; markdown?: string }> } | Array<{ url: string; title?: string; markdown?: string }>;
+      data?:
+        | { web?: Array<{ url: string; title?: string; markdown?: string }> }
+        | Array<{ url: string; title?: string; markdown?: string }>;
     };
     const raw = Array.isArray(json.data) ? json.data : json.data?.web ?? [];
-    return raw.slice(0, 2).map((r) => ({
+    return raw.slice(0, 3).map((r) => ({
       url: r.url,
       title: r.title ?? r.url,
       markdown: (r.markdown ?? "").slice(0, 4000),

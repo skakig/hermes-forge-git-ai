@@ -8,7 +8,7 @@ import {
 import { toast } from "sonner";
 import { useServerFn } from "@tanstack/react-start";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { startHermesLoop, pollLoopStatus, listLoops, cancelLoop, resumeLoop } from "@/lib/hermes.functions";
+import { startHermesLoop, pollLoopStatus, listLoops, cancelLoop, resumeLoop, getHermesCapabilities } from "@/lib/hermes.functions";
 import { listConnectedRepos } from "@/lib/dashboard.functions";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
@@ -206,6 +206,7 @@ export function LoopControl() {
   const pollFn = useServerFn(pollLoopStatus);
   const cancelFn = useServerFn(cancelLoop);
   const resumeFn = useServerFn(resumeLoop);
+  const fetchCaps = useServerFn(getHermesCapabilities);
   const [selectedRepo, setSelectedRepo] = useState<string | undefined>();
   const [bugReport, setBugReport] = useState("");
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -214,6 +215,12 @@ export function LoopControl() {
     queryKey: ["forge", "connected-repos"],
     queryFn: () => fetchRepos(),
     staleTime: 10_000,
+  });
+
+  const capsQuery = useQuery({
+    queryKey: ["forge", "capabilities"],
+    queryFn: () => fetchCaps(),
+    staleTime: 60_000,
   });
 
   const loopsQuery = useQuery({
@@ -290,6 +297,16 @@ export function LoopControl() {
               ? "Add a repository to The Forge first (Dashboard → Repositories) before igniting a loop."
               : "The agent audits the repo, drafts a PR with its plan, edits files, then flips the PR to ready for review — autonomously."}
           </p>
+          {capsQuery.data && !capsQuery.data.firecrawl ? (
+            <p className="text-xs text-amber-300/80 mt-2 max-w-lg">
+              Tip: connect Firecrawl in Workspace → Connectors to give Hermes web-verified rules briefs (game rules, RFCs, specs) before it edits code.
+            </p>
+          ) : null}
+          {capsQuery.data?.firecrawl ? (
+            <p className="text-xs text-emerald-300/70 mt-2 max-w-lg">
+              Firecrawl connected · research phase will web-verify rules before patching.
+            </p>
+          ) : null}
         </div>
         <div className="flex items-center gap-3">
           {running ? (

@@ -1,73 +1,37 @@
-# Hermes audit — where we are, what's blocking real self-improvement
+## Goal
 
-## What's already shipped and working
+Make loop status honestly reflect PR outcome: a PR that was merged is a success (even if some checks failed); a PR that's closed-without-merge or gone is an ERROR; failing checks on an open PR keep repairing until attempts are exhausted.
 
-- **`validateProposedFile` (unbypassable pre-commit gate)** — catches `'''`, `"""`, and ` ``` ` at the start, end, or any standalone line; markdown fences; chat preambles; null bytes; broken JSON; unbalanced brackets; and a first-line JS/TS shape check. Runs at three points: after the AI edit, after the one-shot repair, and one final belt-and-braces call immediately before `putFile`.
-- **One-shot repair** — when a file is rejected, Hermes sends the exact rule name + message back to the AI and re-validates the response before pushing.
-- **Merged-PR reconciliation** — when CI fails, `runChecksPending` asks GitHub if the PR was merged anyway. If yes → `completed` with a "merged with failures" banner instead of `ERROR`.
-- **Research phase** — sits between `plan` and `draft_pr`. Produces a rules brief with cited sources; when the Firecrawl connector is linked the top query is scraped via the Lovable gateway and the markdown appended. Rules go verbatim into the patch system prompt.
-- **UI** — research panel with source links, merged-with-failures banner, validator rule names, "Connect Firecrawl" hint on the ritual card, per-loop repair counter, failure-log expansion.
-- **Durable worker** — `pg_cron` drives phase transitions; per-loop `phase_running` lock kills the parallel-poller race. `runDraftPr` uses a stable branch name and recovers from `gh_422`.
+## Current behavior
 
-## What's still going wrong (the two problems from your last run)
+`runChecksPending` only reconciles with merge state on the first failing-check tick. If checks fail again after repair attempts are exhausted, the loop is marked `failed / blocked` even when GitHub merged the PR in the meantime. There's also no reconciliation when the PR was closed without merging — that case looks identical to "checks failing".
 
-1. **Stray `'''` shipped in older PRs** — those PRs (#5, commit 1d02eb4) predate the strict validator. Every NEW run should get caught. There is nothing more to fix in the validator itself; we just need a clean run to confirm.
-2. **Farkle rule fix was structurally incomplete** — the agent's plan phase locked in a suspect-file list (`useGameState.ts`, `gameLogic.ts`) that didn't include the scoring-validation module. Its "proposed change" was already too narrow before the patch phase ran. Even a perfect patch can't fix what isn't in scope.
+## Changes (single file: `src/lib/hermes.server.ts`, `runChecksPending`)
 
-The Hermes loop's real weakness right now is not code emission. It's **planning depth**: the agent commits to a shallow file list too early, so the patch phase optimizes a fix that can't actually address the bug.
+1. **Reconcile PR state on every failing-checks branch, not just the first.**
+   Move the `getPRState` call up so it runs before we decide between "diagnose & repair" and "give up / block". Use its result in three ways:
 
-## The plan — three focused upgrades
+   - `prState.merged === true` → return `status: completed`, `phase: completed`, `checks_status: merged_with_failures` (existing branch, unchanged wording). Applies whether or not attempts are exhausted.
+   - `prState.state === "closed" && !prState.merged` → return `status: failed`, `phase: blocked`, `checks_status: pr_closed`, `last_error: "PR #N was closed without merging"`, `comment_kind: error`. This is the only "actually rejected" terminal outcome.
+   - Otherwise (PR still open) → keep existing behavior: diagnose_failure until `attempt_count >= max_attempts`, then `blocked / failure` with the current "Giving up after N repair attempts" message.
 
-### 1. Deeper planning: `plan` phase reads code before locking scope
+2. **Handle PR-not-found.**
+   Extend `getPRState` (or wrap the call) so a 404 from GitHub surfaces as a distinct signal. On 404, return `status: failed`, `phase: blocked`, `checks_status: pr_missing`, `last_error: "PR #N no longer exists on GitHub"`. Do this by catching the `gh` error and inspecting the message for `404`; no new helper file needed.
 
-Today `runPlan` sees only the audit brief + goals + bug report. It picks suspect files by pattern-matching filenames from the audit. That's why it missed the scoring validator on the Farkle bug.
+3. **Fail-soft on transient reconciliation errors.**
+   If `getPRState` throws for any other reason, log and fall through to the existing diagnose/repair path — don't crash the phase. (Already the case for the "before giving up" branch; keep that shape for the unified path.)
 
-Change `runPlan` to:
+4. **No changes** to `runChecksPending`'s success or no-checks branches, to any other phase, or to the UI. The dashboard already renders `merged_with_failures` correctly; `pr_closed` and `pr_missing` will show through the existing `checks_status · <value>` line and `last_error` block without new components.
 
-- After the AI returns an initial hypothesis, do a second AI turn where the model is shown the actual contents of the top 3 candidate files it just named, plus a search-derived shortlist of any file whose text contains keywords from the bug report ("farkle", "bust", "score", "selection", etc.).
-- Then have the model finalize `suspect_files` (up to 5) with the option to swap files based on what it just read.
+## Technical detail
 
-This is one extra AI call per loop; the payoff is a suspect list that reflects reality, not filename guesses.
+- `runChecksPending` in `src/lib/hermes.server.ts` (lines ~1375–1530). Restructure the `failed.length > 0` block so `getPRState` is called first and its outcome drives one of three returns above. Keep `checks_payload` (with `failure_logs`) populated on every terminal return so the dashboard still shows the failing checks/logs when we mark `pr_closed` or `pr_missing`.
+- `getPRState` in `src/lib/github-app.server.ts` (line 484) is unchanged; the 404 detection happens at the call site by catching and matching the thrown error's message. `gh()` already throws with the HTTP status embedded, so no new plumbing needed.
+- No migration, no schema change, no new phase, no worker change.
 
-### 2. Bug-report-driven grep-first candidate discovery
+## Verification
 
-Add a small deterministic step before `runPlan`: for each significant term in `bug_report` (nouns ≥ 4 chars, dedup, drop stopwords), grep the repo tree for files whose contents contain that term. Feed the top 8 hits into the plan phase alongside the audit brief.
-
-This is a repository-side signal the AI cannot invent — it forces the model to consider the files that actually mention the buggy concept, even if their filenames don't advertise it.
-
-### 3. Post-patch spec verification: does the diff satisfy the rules brief?
-
-Right now `runPatch` writes files and moves on. Add a `runVerify` step between `commit` and `ready` that:
-
-- Reads the final contents of every touched file from the branch.
-- Sends them + the research brief to the AI with one question: *"Does this diff actually implement rules 1..N, or does it skip any?"*
-- If the model says a rule is not implemented, add a PR comment listing the gap and (a) go back to `patch` with the rules-gap message as the new failure log, up to the same `max_attempts` budget, or (b) mark the loop `blocked` with a clear explanation.
-
-This is the closed-loop verification that turns "the agent shipped a plausible diff" into "the agent shipped a diff that satisfies the spec". It's the piece missing today that let PR #5 ship a half-fix.
-
-## Files that will change
-
-- `src/lib/hermes.server.ts`
-  - `runPlan`: two-stage plan (hypothesize → read candidates → refine scope).
-  - New helper `discoverCandidateFiles(tree, bugReport)`: keyword-based grep over the audit tree.
-  - New phase runner `runVerify`; add `"verify"` to `phaseOrder`.
-- `src/components/forge/LoopControl.tsx`: add `verify` to the phase progress list with a label like "Verifying spec compliance".
-- `supabase/migrations/*` (new): add `verify` to any phase enum / check constraint if one exists on `loops.phase`, otherwise no schema change needed.
-- `src/lib/hermes.functions.ts`: no changes.
-
-## Not doing (kept out of scope on purpose)
-
-- Running the actual TypeScript compiler or a bundler inside the Worker to catch build errors pre-commit. The Worker runtime doesn't ship tsc, and we've already committed to Netlify's build as the ground truth via the CI feedback loop.
-- Rewriting the patch phase — it's fine. The problem is upstream (scope) and downstream (verification), not in the edit itself.
-- Adding a separate "test writer" phase. Worth doing later, but only after we prove the plan/verify loop closes the gap on the Farkle-style half-fixes.
-
-## Success criteria
-
-Re-ignite on `dice-strategy-oracle` with the same Farkle bug report. We expect to see:
-
-1. `research` phase produces a rules brief citing official Farkle rules (Firecrawl now connected).
-2. `plan` phase's final `suspect_files` includes the scoring validation module, not just the state hook.
-3. `verify` phase either confirms every rule is implemented, or bounces back to `patch` with a specific gap.
-4. Loop ends `completed` (green), not `ERROR`, whether or not the PR is auto-merged.
-
-If any of those fail we have a concrete diagnostic instead of "the PR looks reasonable but the game is still broken."
+After edits, ignite a loop that produces a failing-check PR and:
+- merge the PR manually → loop should flip to `completed / merged_with_failures`.
+- close the PR without merging → loop should flip to `blocked / pr_closed`.
+- leave PR open with failing checks → existing diagnose/repair path runs and, after `max_attempts`, ends `blocked / failure` as today.
